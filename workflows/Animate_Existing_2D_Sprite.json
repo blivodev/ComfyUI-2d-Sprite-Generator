@@ -1,0 +1,602 @@
+{
+  "last_node_id": 12,
+  "last_link_id": 11,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        60,
+        100
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "minion_creature_00001_.png",
+        "image"
+      ],
+      "title": "\ud83d\udcc1 Load 2D Sprite / Character Image"
+    },
+    {
+      "id": 2,
+      "type": "BiRefNetRMBG",
+      "pos": [
+        440,
+        100
+      ],
+      "size": [
+        320,
+        260
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2,
+            3
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": []
+        },
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BiRefNetRMBG"
+      },
+      "widgets_values": [
+        "BiRefNet_toonout",
+        0,
+        0,
+        false,
+        false,
+        "Alpha",
+        "#222222"
+      ],
+      "title": "\u2702\ufe0f BiRefNet Toonout (Background Cutout)"
+    },
+    {
+      "id": 3,
+      "type": "SaveImage",
+      "pos": [
+        440,
+        400
+      ],
+      "size": [
+        320,
+        240
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "sprite_transparent_cutout"
+      ],
+      "title": "Save Cutout Sprite (PNG)"
+    },
+    {
+      "id": 4,
+      "type": "SplitImageToTileList",
+      "pos": [
+        820,
+        100
+      ],
+      "size": [
+        280,
+        140
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SplitImageToTileList"
+      },
+      "widgets_values": [
+        416,
+        608,
+        0
+      ],
+      "title": "Slice Frames / Tiles"
+    },
+    {
+      "id": 5,
+      "type": "RebatchImages",
+      "pos": [
+        1140,
+        100
+      ],
+      "size": [
+        220,
+        90
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            5,
+            6,
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RebatchImages"
+      },
+      "widgets_values": [
+        4
+      ],
+      "title": "Batch Animation Frames"
+    },
+    {
+      "id": 6,
+      "type": "SaveAnimatedPNG",
+      "pos": [
+        1400,
+        100
+      ],
+      "size": [
+        320,
+        300
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveAnimatedPNG"
+      },
+      "widgets_values": [
+        "animated_sprite_preview",
+        6.0,
+        4
+      ],
+      "title": "\ud83c\udfac Animated PNG (APNG Preview Loop)"
+    },
+    {
+      "id": 7,
+      "type": "SaveAnimatedWEBP",
+      "pos": [
+        1400,
+        440
+      ],
+      "size": [
+        320,
+        240
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 6
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveAnimatedWEBP"
+      },
+      "widgets_values": [
+        "animated_sprite_preview",
+        6.0,
+        true,
+        90,
+        "default"
+      ],
+      "title": "\ud83c\udfac Animated WebP (Loop Preview)"
+    },
+    {
+      "id": 8,
+      "type": "ImageScale",
+      "pos": [
+        1140,
+        240
+      ],
+      "size": [
+        240,
+        160
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageScale"
+      },
+      "widgets_values": [
+        "nearest-exact",
+        52,
+        76,
+        "disabled"
+      ],
+      "title": "\ud83d\udc7e Retro Downscale (Chunky Pixels)"
+    },
+    {
+      "id": 9,
+      "type": "ImageScale",
+      "pos": [
+        1140,
+        440
+      ],
+      "size": [
+        240,
+        160
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            9,
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageScale"
+      },
+      "widgets_values": [
+        "nearest-exact",
+        208,
+        304,
+        "disabled"
+      ],
+      "title": "\ud83d\udc7e Retro Upscale (Crisp Display)"
+    },
+    {
+      "id": 10,
+      "type": "SaveAnimatedPNG",
+      "pos": [
+        1760,
+        100
+      ],
+      "size": [
+        320,
+        300
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 9
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveAnimatedPNG"
+      },
+      "widgets_values": [
+        "retro_pixelart_loop",
+        6.0,
+        4
+      ],
+      "title": "\ud83d\udc7e Retro Pixel Art Animation Loop"
+    },
+    {
+      "id": 11,
+      "type": "ImageGrid",
+      "pos": [
+        1760,
+        440
+      ],
+      "size": [
+        260,
+        160
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageGrid"
+      },
+      "widgets_values": [
+        4,
+        208,
+        304,
+        0
+      ],
+      "title": "Pack into Sprite Sheet"
+    },
+    {
+      "id": 12,
+      "type": "SaveImage",
+      "pos": [
+        2060,
+        440
+      ],
+      "size": [
+        320,
+        240
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 11
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "master_spritesheet"
+      ],
+      "title": "Save Master Sprite Sheet (PNG)"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      2,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ],
+    [
+      5,
+      5,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      6,
+      5,
+      0,
+      7,
+      0,
+      "IMAGE"
+    ],
+    [
+      7,
+      5,
+      0,
+      8,
+      0,
+      "IMAGE"
+    ],
+    [
+      8,
+      8,
+      0,
+      9,
+      0,
+      "IMAGE"
+    ],
+    [
+      9,
+      9,
+      0,
+      10,
+      0,
+      "IMAGE"
+    ],
+    [
+      10,
+      9,
+      0,
+      11,
+      0,
+      "IMAGE"
+    ],
+    [
+      11,
+      11,
+      0,
+      12,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "title": "1. Load Existing Sprite & Auto Alpha Cutout",
+      "bounding": [
+        40,
+        40,
+        740,
+        680
+      ],
+      "color": "#3f2b96"
+    },
+    {
+      "title": "2. Frame Slicing & Real-time Transparent APNG Preview",
+      "bounding": [
+        800,
+        40,
+        940,
+        680
+      ],
+      "color": "#205072"
+    },
+    {
+      "title": "3. PixelLab Retro Snapper & Packed Sprite Sheet Export",
+      "bounding": [
+        1740,
+        40,
+        660,
+        680
+      ],
+      "color": "#5c258d"
+    }
+  ],
+  "config": {},
+  "extra": {
+    "workspace_info": {
+      "name": "Animate Existing 2D Sprite"
+    }
+  },
+  "version": 0.4
+}
