@@ -8,11 +8,24 @@
 ## 🌟 Key Features
 
 * **52 Full Game Movesets**: Walk, Run, Jump, Double Jump, Crouch, Dash, Slide, Punches 1–3, Kicks 1–4, Air Attacks, Crouch Moves, Defenses, Status Conditions (Burn, Freeze, Poison, Paralyze, Stun), Item Interactions, and 4 Ultimate Specials.
+* **🎨 Non-Pixel & Vector Art Mediums**: Generate true non-pixel art alongside pixel styles:
+  * **Smooth HD Vector Art**: Crisp SVG/vector aesthetic with bold silhouettes and clean cell outlines.
+  * **Detailed Hand-Drawn 2D**: High-definition hand-drawn arcade fighting game style with rich shading.
+  * **Painterly 2D Concept Art**: Stylized textured fantasy illustration.
+  * **Western Cartoon Brawler**: Expressive animated television show style.
+  * **16-bit & 8-bit Retro Pixel Art**: Authentic chunky pixel art with optional nearest-neighbor snapping.
+* **📐 Custom Sprite Frame Sizing**: Choose from preset defaults or specify exact custom dimensions:
+  * `64x64` (Classic Retro)
+  * `128x128` (Standard Indie Platformer)
+  * `192x256` (Tall Arcade Fighter / Metroidvania)
+  * `256x256` (HD 2D Character)
+  * `512x512` (Ultra High-Res 2D Vector & Boss Sprites)
+  * `Custom (W x H)`: Enter any custom resolution.
 * **🐾 Non-Humanoid & Creature Support**: Instantly adapts the 52 moves for quadrupeds, beasts, monsters, mechs, slimes, and dragons (e.g. punches become claw strikes and bites; kicks become tail whips and rear bucking strikes; jump attacks become aerial pounces).
 * **✨ 2D VFX, Projectiles & Particle Studio**: Generate animated fireballs, plasma orbs, ice shards, magic star missiles, sword slash arcs, impact bursts, explosions, shield barriers, and flame auras.
-* **🚫 Clean Single Output (No Unwanted Duplicates)**: Choose between Clean Cel-Shaded, Retro Pixel Art, or Both.
+* **🚫 Clean Single Output (No Unwanted Duplicates)**: Single clean animation output by default (`standard`), with optional retro downscaled variants (`both`).
 * **📦 Interactive Web Studio UI**:
-  * **Character Studio Tab**: Configure character, customize individual move prompts, and add unlimited custom animations.
+  * **Character Studio Tab**: Configure character, art medium, frame dimensions, customize individual move prompts, and add unlimited custom animations.
   * **VFX & Projectiles Tab**: 15+ built-in particle & projectile presets or prompt any custom spell.
   * **Asset Library Tab**: Live transparent looping previews, download individual APNG/WebP/Sprite Sheets, or download the full character asset pack as a `.zip`.
   * **🔁 Single Move Re-run**: Re-roll any individual animation with custom seeds and modified prompts without regenerating the entire set.

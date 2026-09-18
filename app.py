@@ -1,13 +1,13 @@
 """
 2D Sprite, Animation & VFX Studio Web Application
-Includes:
-- Full 52-Move Character Generator (Humanoid & Non-Humanoid)
-- Customizable Individual Move Prompts + Add Custom Animations
-- Single Animation Re-run & Custom Seeds
-- 2D VFX / Projectiles / Orbs / Slashes / Particles Generator
-- Complete Asset Library Tab (Preview, Filter, Re-run, Delete, Single Download & ZIP Download)
-- Clean Single-Output Option (No duplicate retro outputs by default)
-- AMD Radeon RX 9060 XT (ROCm) / ComfyUI Integration
+Full 52-Move Character Moveset + Non-Humanoids + Custom Moves + VFX Studio + Asset Library
+Supports:
+- Custom Sprite Sizes (64x64, 128x128, 256x256, 512x512, Custom WxH)
+- Normal Detailed 2D & Smooth Vector Art (Non-pixel) + Retro Pixel Art
+- Single Clean Output (No unwanted retro duplicates)
+- Re-run individual animations with custom seed/prompt
+- One-click ZIP download and individual asset downloads
+- AMD Radeon RX 9060 XT (ROCm) / ComfyUI integration
 """
 
 import sys
@@ -240,8 +240,8 @@ VFX_PRESETS = [
 ]
 
 
-def build_character_graph(char_desc, action_item, is_creature, style, output_style, seed, char_name, custom_action_prompt=None):
-    """Builds the ComfyUI workflow JSON for a character animation."""
+def build_character_graph(char_desc, action_item, is_creature, style, output_style, seed, char_name, custom_action_prompt=None, frame_width=256, frame_height=256):
+    """Builds the ComfyUI workflow JSON for a character animation with customizable size and rendering medium."""
     if custom_action_prompt and custom_action_prompt.strip():
         action_desc = custom_action_prompt.strip()
     else:
@@ -250,21 +250,36 @@ def build_character_graph(char_desc, action_item, is_creature, style, output_sty
     prefix = f"{char_name}_{action_item['id']}"
     fps = float(action_item.get("fps", 6.0))
 
+    # Determine if pixel art or smooth detailed/vector 2D
+    is_pixel_style = "Pixel Art" in style or "NES" in style
+
     style_prompts = {
-        "16-bit Retro Pixel Art": "clean 16-bit retro game sprite, bold outlines, flat solid pure white background, distinct separated frames, full body",
-        "Chibi Brawler Sprite": "cute stylized chibi proportions, bold clean cel-shading outlines, vibrant colors, flat solid pure white background, separated frames",
-        "8-bit Classic NES": "authentic 8-bit pixel art, restricted retro palette, crisp pixel grid, flat solid pure white background",
-        "Hand-drawn 2D Cartoon": "hand-drawn 2D animation frames, expressive dynamic poses, flat solid pure white background",
-        "Modern Flat Vector": "modern flat vector art, clean sharp geometry, high contrast, flat solid pure white background"
+        "Smooth HD Vector Art": "smooth clean vector 2d game art, crisp sharp outlines, solid flat color fills, modern indie game sprite, high resolution, no pixel art, no noise",
+        "Detailed Hand-Drawn 2D": "detailed hand-drawn 2d arcade fighting game sprite, crisp ink linework, professional cel-shading, dynamic anatomy, high resolution 2d game asset, no pixel art",
+        "Detailed Painterly 2D": "detailed painterly 2d fantasy game sprite, rich textures, dramatic rim lighting, intricate concept art illustration, high resolution, no pixel art",
+        "Western Cartoon Brawler": "expressive 2d cartoon brawler sprite, bold fluid ink outlines, vibrant cel-shaded color palette, clean modern 2d animation, no pixel art",
+        "16-bit Retro Pixel Art": "clean 16-bit retro pixel art game sprite, bold pixel outlines, classic SNES arcade game sprite",
+        "8-bit Classic NES": "authentic 8-bit retro pixel art, restricted retro palette, crisp retro pixel grid"
     }
-    style_str = style_prompts.get(style, style_prompts["16-bit Retro Pixel Art"])
+    style_str = style_prompts.get(style, style_prompts["Smooth HD Vector Art"])
+
+    if is_pixel_style:
+        medium_header = "pixel art 2d sprite sheet of"
+        neg_prompt = "3d render, photorealistic, noise, gradients, complex background, blurry, overlapping frames, text, watermark"
+    else:
+        medium_header = "clean high-quality 2d game sprite sheet of"
+        neg_prompt = "pixel art, pixelated, 8-bit, 16-bit, chunky pixels, mosaic, 3d render, photorealistic, noise, complex background, blurry, overlapping frames, text, watermark"
 
     pos_prompt = (
-        f"pixel art 2d sprite sheet of {char_desc}, "
+        f"{medium_header} {char_desc}, "
         f"4 animation frames in a horizontal sequence, "
-        f"{action_desc}, {style_str}"
+        f"{action_desc}, {style_str}, "
+        f"flat solid pure white background, distinct separated frames, full body"
     )
-    neg_prompt = "3d render, photorealistic, noise, gradients, complex background, blurry, overlapping frames, text, watermark"
+
+    # Calculate canvas dimensions for 4 frames
+    canvas_w = int(frame_width) * 4
+    canvas_h = int(frame_height)
 
     graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "z_image_turbo_bf16.safetensors", "weight_dtype": "default"}},
@@ -272,7 +287,7 @@ def build_character_graph(char_desc, action_item, is_creature, style, output_sty
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": "z-image-ae.safetensors"}},
         "4": {"class_type": "TextEncodeZImageOmni", "inputs": {"prompt": pos_prompt, "auto_resize_images": True, "clip": ["2", 0]}},
         "5": {"class_type": "TextEncodeZImageOmni", "inputs": {"prompt": neg_prompt, "auto_resize_images": True, "clip": ["2", 0]}},
-        "6": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 256, "batch_size": 1}},
+        "6": {"class_type": "EmptyLatentImage", "inputs": {"width": canvas_w, "height": canvas_h, "batch_size": 1}},
         "7": {"class_type": "KSampler", "inputs": {
             "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0],
             "seed": seed, "control_after_generate": "fixed", "steps": 8, "cfg": 1.0,
@@ -283,56 +298,60 @@ def build_character_graph(char_desc, action_item, is_creature, style, output_sty
             "image": ["8", 0], "model": "BiRefNet_toonout", "mask_blur": 0, "mask_offset": 0,
             "invert_output": False, "refine_foreground": False, "background": "Alpha", "background_color": "#222222"
         }},
-        "10": {"class_type": "SplitImageToTileList", "inputs": {"image": ["9", 0], "tile_width": 256, "tile_height": 256, "overlap": 0}},
+        "10": {"class_type": "SplitImageToTileList", "inputs": {"image": ["9", 0], "tile_width": int(frame_width), "tile_height": int(frame_height), "overlap": 0}},
         "11": {"class_type": "RebatchImages", "inputs": {"images": ["10", 0], "batch_size": 4}},
     }
 
-    # Output selection (fixes the duplicate output issue)
-    if output_style == "retro":
-        # Downscale & Upscale using Nearest-Exact
-        graph["14"] = {"class_type": "ImageScale", "inputs": {"image": ["11", 0], "upscale_method": "nearest-exact", "width": 48, "height": 48, "crop": "disabled"}}
-        graph["15"] = {"class_type": "ImageScale", "inputs": {"image": ["14", 0], "upscale_method": "nearest-exact", "width": 192, "height": 192, "crop": "disabled"}}
+    # Output selection (single clean output by default)
+    if output_style == "retro" and is_pixel_style:
+        down_w = max(16, int(frame_width) // 4)
+        down_h = max(16, int(frame_height) // 4)
+        graph["14"] = {"class_type": "ImageScale", "inputs": {"image": ["11", 0], "upscale_method": "nearest-exact", "width": down_w, "height": down_h, "crop": "disabled"}}
+        graph["15"] = {"class_type": "ImageScale", "inputs": {"image": ["14", 0], "upscale_method": "nearest-exact", "width": int(frame_width), "height": int(frame_height), "crop": "disabled"}}
         graph["16"] = {"class_type": "SaveAnimatedPNG", "inputs": {"images": ["15", 0], "filename_prefix": f"{prefix}_anim", "fps": fps, "compress_level": 4}}
-        graph["17"] = {"class_type": "ImageGrid", "inputs": {"images": ["15", 0], "columns": 4, "cell_width": 192, "cell_height": 192, "padding": 0}}
+        graph["17"] = {"class_type": "ImageGrid", "inputs": {"images": ["15", 0], "columns": 4, "cell_width": int(frame_width), "cell_height": int(frame_height), "padding": 0}}
         graph["18"] = {"class_type": "SaveImage", "inputs": {"images": ["17", 0], "filename_prefix": f"{prefix}_spritesheet"}}
-    elif output_style == "both":
-        # Save standard
-        graph["12"] = {"class_type": "SaveAnimatedPNG", "inputs": {"images": ["11", 0], "filename_prefix": f"{prefix}_anim", "fps": fps, "compress_level": 4}}
-        graph["13"] = {"class_type": "SaveAnimatedWEBP", "inputs": {"images": ["11", 0], "filename_prefix": f"{prefix}_webp", "fps": fps, "lossless": True, "quality": 90, "method": "default"}}
-        graph["17"] = {"class_type": "ImageGrid", "inputs": {"images": ["11", 0], "columns": 4, "cell_width": 256, "cell_height": 256, "padding": 0}}
-        graph["18"] = {"class_type": "SaveImage", "inputs": {"images": ["17", 0], "filename_prefix": f"{prefix}_spritesheet"}}
-        # And save retro
-        graph["14"] = {"class_type": "ImageScale", "inputs": {"image": ["11", 0], "upscale_method": "nearest-exact", "width": 48, "height": 48, "crop": "disabled"}}
-        graph["15"] = {"class_type": "ImageScale", "inputs": {"image": ["14", 0], "upscale_method": "nearest-exact", "width": 192, "height": 192, "crop": "disabled"}}
-        graph["16"] = {"class_type": "SaveAnimatedPNG", "inputs": {"images": ["15", 0], "filename_prefix": f"{prefix}_retro_anim", "fps": fps, "compress_level": 4}}
     else:
-        # Standard clean output (Default: SINGLE ANIMATION)
+        # Standard clean output (Smooth Vector, Detailed 2D, or Clean Pixel Art)
         graph["12"] = {"class_type": "SaveAnimatedPNG", "inputs": {"images": ["11", 0], "filename_prefix": f"{prefix}_anim", "fps": fps, "compress_level": 4}}
         graph["13"] = {"class_type": "SaveAnimatedWEBP", "inputs": {"images": ["11", 0], "filename_prefix": f"{prefix}_webp", "fps": fps, "lossless": True, "quality": 90, "method": "default"}}
-        graph["17"] = {"class_type": "ImageGrid", "inputs": {"images": ["11", 0], "columns": 4, "cell_width": 256, "cell_height": 256, "padding": 0}}
+        graph["17"] = {"class_type": "ImageGrid", "inputs": {"images": ["11", 0], "columns": 4, "cell_width": int(frame_width), "cell_height": int(frame_height), "padding": 0}}
         graph["18"] = {"class_type": "SaveImage", "inputs": {"images": ["17", 0], "filename_prefix": f"{prefix}_spritesheet"}}
 
     return graph
 
 
-def build_vfx_graph(vfx_desc, vfx_id, seed, name_prefix):
+def build_vfx_graph(vfx_desc, vfx_id, style, seed, name_prefix, frame_width=256, frame_height=256):
     """Builds the ComfyUI workflow JSON for a 2D VFX / Projectile / Particle animation."""
     prefix = f"{name_prefix}_{vfx_id}"
+    is_pixel = "Pixel Art" in style
+
+    if is_pixel:
+        header = "pixel art 2d sprite sheet of"
+        style_desc = "vibrant 16-bit retro arcade video game special effect VFX, crisp bold outlines"
+        neg = "human, character, face, photorealistic, noise, complex background, text, watermark, blurry, overlapping frames"
+    else:
+        header = "clean 2d vector game special effect sprite sheet of"
+        style_desc = "smooth modern 2d game VFX, radiant energy glow, crisp particle shapes, high resolution vector graphics, no pixel art"
+        neg = "pixel art, pixelated, 8-bit, 16-bit, human, character, face, photorealistic, noise, complex background, text, watermark, blurry, overlapping frames"
+
     pos_prompt = (
-        f"pixel art 2d sprite sheet of {vfx_desc}, "
+        f"{header} {vfx_desc}, "
         f"4 sequential animation frames in a horizontal sequence, "
-        f"high contrast vibrant video game special effect VFX, clean bold outlines, "
+        f"{style_desc}, "
         f"flat solid pure white background, distinct separated frames"
     )
-    neg_prompt = "human, character, face, body, photorealistic, noise, gradients, complex background, text, watermark, blurry, overlapping frames"
+
+    canvas_w = int(frame_width) * 4
+    canvas_h = int(frame_height)
 
     return {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "z_image_turbo_bf16.safetensors", "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_4b.safetensors", "type": "qwen_image"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": "z-image-ae.safetensors"}},
         "4": {"class_type": "TextEncodeZImageOmni", "inputs": {"prompt": pos_prompt, "auto_resize_images": True, "clip": ["2", 0]}},
-        "5": {"class_type": "TextEncodeZImageOmni", "inputs": {"prompt": neg_prompt, "auto_resize_images": True, "clip": ["2", 0]}},
-        "6": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 256, "batch_size": 1}},
+        "5": {"class_type": "TextEncodeZImageOmni", "inputs": {"prompt": neg, "auto_resize_images": True, "clip": ["2", 0]}},
+        "6": {"class_type": "EmptyLatentImage", "inputs": {"width": canvas_w, "height": canvas_h, "batch_size": 1}},
         "7": {"class_type": "KSampler", "inputs": {
             "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0],
             "seed": seed, "control_after_generate": "fixed", "steps": 8, "cfg": 1.0,
@@ -343,11 +362,11 @@ def build_vfx_graph(vfx_desc, vfx_id, seed, name_prefix):
             "image": ["8", 0], "model": "BiRefNet_toonout", "mask_blur": 0, "mask_offset": 0,
             "invert_output": False, "refine_foreground": False, "background": "Alpha", "background_color": "#222222"
         }},
-        "10": {"class_type": "SplitImageToTileList", "inputs": {"image": ["9", 0], "tile_width": 256, "tile_height": 256, "overlap": 0}},
+        "10": {"class_type": "SplitImageToTileList", "inputs": {"image": ["9", 0], "tile_width": int(frame_width), "tile_height": int(frame_height), "overlap": 0}},
         "11": {"class_type": "RebatchImages", "inputs": {"images": ["10", 0], "batch_size": 4}},
         "12": {"class_type": "SaveAnimatedPNG", "inputs": {"images": ["11", 0], "filename_prefix": f"{prefix}_anim", "fps": 8.0, "compress_level": 4}},
         "13": {"class_type": "SaveAnimatedWEBP", "inputs": {"images": ["11", 0], "filename_prefix": f"{prefix}_webp", "fps": 8.0, "lossless": True, "quality": 90, "method": "default"}},
-        "14": {"class_type": "ImageGrid", "inputs": {"images": ["11", 0], "columns": 4, "cell_width": 256, "cell_height": 256, "padding": 0}},
+        "14": {"class_type": "ImageGrid", "inputs": {"images": ["11", 0], "columns": 4, "cell_width": int(frame_width), "cell_height": int(frame_height), "padding": 0}},
         "15": {"class_type": "SaveImage", "inputs": {"images": ["14", 0], "filename_prefix": f"{prefix}_spritesheet"}}
     }
 
@@ -423,8 +442,8 @@ header {
 .tab-content { display: none; }
 .tab-content.active { display: block; }
 
-.container { max-width: 1360px; margin: 24px auto; padding: 0 20px; }
-.grid-layout { display: grid; grid-template-columns: 440px 1fr; gap: 24px; }
+.container { max-width: 1380px; margin: 24px auto; padding: 0 20px; }
+.grid-layout { display: grid; grid-template-columns: 460px 1fr; gap: 24px; }
 
 .panel {
   background: var(--bg-card);
@@ -435,9 +454,9 @@ header {
 
 h2 { font-size: 16px; font-weight: 700; color: #fff; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
 
-.form-group { margin-bottom: 16px; }
+.form-group { margin-bottom: 14px; }
 label { display: block; font-size: 11px; font-weight: 700; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
-input[type="text"], textarea, select {
+input[type="text"], input[type="number"], textarea, select {
   width: 100%;
   background: var(--bg-item);
   border: 1px solid var(--border);
@@ -448,8 +467,8 @@ input[type="text"], textarea, select {
   outline: none;
   transition: border-color 0.2s;
 }
-input[type="text"]:focus, textarea:focus, select:focus { border-color: var(--accent); }
-textarea { resize: vertical; min-height: 80px; }
+input[type="text"]:focus, input[type="number"]:focus, textarea:focus, select:focus { border-color: var(--accent); }
+textarea { resize: vertical; min-height: 75px; }
 
 .radio-pill-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .radio-pill {
@@ -498,6 +517,8 @@ textarea { resize: vertical; min-height: 80px; }
   cursor: pointer;
   font-weight: 600;
   transition: all 0.15s;
+  text-decoration: none;
+  display: inline-block;
 }
 .btn-sm:hover { color: #fff; border-color: var(--accent); }
 .btn-sm.btn-danger:hover { color: #fff; border-color: var(--danger); background: #881337; }
@@ -515,7 +536,7 @@ textarea { resize: vertical; min-height: 80px; }
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 10px;
-  max-height: 650px;
+  max-height: 680px;
   overflow-y: auto;
   padding-right: 6px;
 }
@@ -542,7 +563,7 @@ textarea { resize: vertical; min-height: 80px; }
   color: #cbd5e1;
   outline: none;
   resize: none;
-  height: 44px;
+  height: 42px;
 }
 .anim-prompt-box:focus { border-color: var(--accent); }
 
@@ -568,7 +589,7 @@ textarea { resize: vertical; min-height: 80px; }
 }
 .library-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
   gap: 16px;
 }
 .asset-card {
@@ -620,7 +641,7 @@ textarea { resize: vertical; min-height: 80px; }
         <h2>1. Character Configuration</h2>
 
         <div class="form-group">
-          <label>Character Name / Prefix</label>
+          <label>Character Name / Tag</label>
           <input type="text" id="charName" value="shadow_ninja" placeholder="e.g. cyber_wolf, flame_mage">
         </div>
 
@@ -630,7 +651,7 @@ textarea { resize: vertical; min-height: 80px; }
         </div>
 
         <div class="form-group">
-          <label>Anatomy & Movement Type</label>
+          <label>Anatomy & Movement Mode</label>
           <div class="radio-pill-group">
             <label class="radio-pill active" id="pillHuman">
               <input type="radio" name="anatomy" value="human" checked onchange="toggleAnatomy(false)">
@@ -646,22 +667,46 @@ textarea { resize: vertical; min-height: 80px; }
         </div>
 
         <div class="form-group">
-          <label>Style Preset</label>
-          <select id="artStyle">
-            <option value="16-bit Retro Pixel Art">16-bit Retro Pixel Art (Default)</option>
-            <option value="Chibi Brawler Sprite">Chibi Brawler Sprite (Cute, HD)</option>
-            <option value="8-bit Classic NES">8-bit Classic NES</option>
-            <option value="Hand-drawn 2D Cartoon">Hand-drawn 2D Cartoon</option>
-            <option value="Modern Flat Vector">Modern Flat Vector</option>
+          <label>Art Medium & Rendering Style</label>
+          <select id="artStyle" onchange="updateStyleNotice()">
+            <option value="Smooth HD Vector Art" selected>Smooth HD Vector Art (Clean flat 2D, No pixels - Hollow Knight style)</option>
+            <option value="Detailed Hand-Drawn 2D">Detailed Hand-Drawn 2D (Arcade fighting game, sharp cel-shaded lines)</option>
+            <option value="Detailed Painterly 2D">Detailed Painterly 2D (Rich textures, rim lighting, Castlevania/Darkest Dungeon)</option>
+            <option value="Western Cartoon Brawler">Western Cartoon Brawler (Expressive outlines, Cuphead/TMNT style)</option>
+            <option value="16-bit Retro Pixel Art">16-bit Retro Pixel Art (Classic SNES/Arcade pixel blocks)</option>
+            <option value="8-bit Classic NES">8-bit Classic NES (Chunky retro pixels, restricted palette)</option>
           </select>
         </div>
 
+        <!-- Sprite Size Selection -->
         <div class="form-group">
-          <label>Output Format (No Duplicates)</label>
+          <label>Sprite Frame Size</label>
+          <select id="spriteSizePreset" onchange="handleSizeChange()">
+            <option value="256x256" selected>256 x 256 (High-Res 2D / Vector - Default)</option>
+            <option value="512x512">512 x 512 (Ultra-HD / 4K Detailed Vector)</option>
+            <option value="128x128">128 x 128 (HD Pixel Art / Compact 2D)</option>
+            <option value="64x64">64 x 64 (Classic 16-bit / Retro)</option>
+            <option value="192x256">192 x 256 (Tall Brawler / Platformer Sprite)</option>
+            <option value="custom">Custom Dimensions (w x h)...</option>
+          </select>
+        </div>
+
+        <div id="customSizeRow" style="display:none; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:14px;">
+          <div>
+            <label>Width (px)</label>
+            <input type="number" id="customWidth" value="256" min="32" max="1024" step="8">
+          </div>
+          <div>
+            <label>Height (px)</label>
+            <input type="number" id="customHeight" value="256" min="32" max="1024" step="8">
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Output Format (Single Output - No Duplicates)</label>
           <select id="outputStyle">
-            <option value="standard" selected>Clean Cel-Shaded Animation (Single output)</option>
+            <option value="standard" selected>Standard Clean Animation (Single output)</option>
             <option value="retro">PixelLab Chunky Pixel Art (Nearest-Neighbor)</option>
-            <option value="both">Both (Standard + Retro duplicate)</option>
           </select>
         </div>
 
@@ -731,12 +776,29 @@ textarea { resize: vertical; min-height: 80px; }
 
         <div class="form-group">
           <label>VFX Set Name</label>
-          <input type="text" id="vfxName" value="fire_magic" placeholder="e.g. plasma_fx, slash_effects">
+          <input type="text" id="vfxName" value="plasma_blast" placeholder="e.g. fire_magic, slash_fx">
         </div>
 
         <div class="form-group">
           <label>Custom VFX Prompt (or pick from right)</label>
-          <textarea id="vfxDesc" placeholder="e.g. swirling blue electric orb with crackling lightning discharge...">fiery plasma energy fireball projectile flying forward, swirling orange flame particles, glowing bright combustion trail</textarea>
+          <textarea id="vfxDesc" placeholder="Describe the energy, color, particles, explosion, or projectile motion...">glowing electric blue plasma energy orb with crackling lightning arcs swirling around core</textarea>
+        </div>
+
+        <div class="form-group">
+          <label>VFX Art Style</label>
+          <select id="vfxStyle">
+            <option value="Smooth HD Vector Art" selected>Smooth HD Vector VFX (Clean glow, modern indie game)</option>
+            <option value="16-bit Retro Pixel Art">16-bit Retro Pixel Art VFX (Arcade pixel energy)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>VFX Frame Size</label>
+          <select id="vfxSize">
+            <option value="256x256" selected>256 x 256 (High Resolution - Default)</option>
+            <option value="128x128">128 x 128 (Compact)</option>
+            <option value="512x512">512 x 512 (Cinematic Screen-Filling VFX)</option>
+          </select>
         </div>
 
         <div class="form-group" style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
@@ -763,7 +825,7 @@ textarea { resize: vertical; min-height: 80px; }
 
       <!-- Right VFX Preset Selector -->
       <div class="panel">
-        <h2>2. VFX Presets Library (Click to Load or Select Multiple)</h2>
+        <h2>2. VFX Presets Library (Click to Load Preset)</h2>
         <div class="anim-grid" id="vfxGrid"></div>
       </div>
     </div>
@@ -874,6 +936,41 @@ async function init() {
   renderAnimations();
   renderVFX();
   loadAssetLibrary();
+}
+
+function handleSizeChange() {
+  const sel = document.getElementById('spriteSizePreset').value;
+  const customRow = document.getElementById('customSizeRow');
+  if (sel === 'custom') {
+    customRow.style.display = 'grid';
+  } else {
+    customRow.style.display = 'none';
+    const parts = sel.split('x');
+    document.getElementById('customWidth').value = parts[0];
+    document.getElementById('customHeight').value = parts[1];
+  }
+}
+
+function getSelectedDimensions() {
+  const sel = document.getElementById('spriteSizePreset').value;
+  if (sel === 'custom') {
+    return {
+      w: parseInt(document.getElementById('customWidth').value) || 256,
+      h: parseInt(document.getElementById('customHeight').value) || 256
+    };
+  } else {
+    const parts = sel.split('x');
+    return { w: parseInt(parts[0]), h: parseInt(parts[1]) };
+  }
+}
+
+function updateStyleNotice() {
+  const style = document.getElementById('artStyle').value;
+  const isPixel = style.includes('Pixel Art') || style.includes('NES');
+  const outStyle = document.getElementById('outputStyle');
+  if (!isPixel) {
+    outStyle.value = 'standard';
+  }
 }
 
 function switchTab(tabId) {
@@ -1014,6 +1111,7 @@ async function submitRerun() {
   const style = document.getElementById('artStyle').value;
   const outputStyle = document.getElementById('outputStyle').value;
   const customPrompt = document.getElementById('rerunPrompt').value.trim();
+  const dims = getSelectedDimensions();
 
   closeRerunModal();
 
@@ -1025,7 +1123,9 @@ async function submitRerun() {
     output_style: outputStyle,
     is_creature: isCreatureMode,
     action_item: currentRerunItem,
-    custom_prompt: customPrompt
+    custom_prompt: customPrompt,
+    frame_width: dims.w,
+    frame_height: dims.h
   };
 
   try {
@@ -1049,6 +1149,7 @@ async function startGeneration() {
   const style = document.getElementById('artStyle').value;
   const outputStyle = document.getElementById('outputStyle').value;
   const selectedMoves = animations.filter(a => a.selected !== false);
+  const dims = getSelectedDimensions();
 
   if (selectedMoves.length === 0) {
     alert("Please select at least one animation!");
@@ -1060,7 +1161,7 @@ async function startGeneration() {
   btn.innerText = "⏳ Queuing into ComfyUI...";
 
   document.getElementById('statusBar').style.display = 'block';
-  document.getElementById('statusText').innerText = `Queuing ${selectedMoves.length} animations...`;
+  document.getElementById('statusText').innerText = `Queuing ${selectedMoves.length} animations (${dims.w}x${dims.h})...`;
 
   const payload = {
     char_name: name,
@@ -1069,7 +1170,9 @@ async function startGeneration() {
     style: style,
     output_style: outputStyle,
     is_creature: isCreatureMode,
-    selected_moves: selectedMoves
+    selected_moves: selectedMoves,
+    frame_width: dims.w,
+    frame_height: dims.h
   };
 
   try {
@@ -1141,12 +1244,20 @@ function renderVFX() {
 async function startVFXGeneration() {
   const name = document.getElementById('vfxName').value.trim() || 'vfx';
   const desc = document.getElementById('vfxDesc').value.trim();
+  const style = document.getElementById('vfxStyle').value;
   const seed = parseInt(document.getElementById('vfxSeed').value) || 987654;
+
+  const sizeVal = document.getElementById('vfxSize').value.split('x');
+  const fw = parseInt(sizeVal[0]);
+  const fh = parseInt(sizeVal[1]);
 
   const payload = {
     vfx_name: name,
     vfx_desc: desc,
-    seed: seed
+    style: style,
+    seed: seed,
+    frame_width: fw,
+    frame_height: fh
   };
 
   try {
@@ -1155,7 +1266,7 @@ async function startVFXGeneration() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
-    alert(`Queued VFX '${name}' to ComfyUI!`);
+    alert(`Queued VFX '${name}' (${fw}x${fh}) to ComfyUI!`);
     loadAssetLibrary();
   } catch (err) {
     alert("Error: " + err);
@@ -1280,7 +1391,6 @@ class StudioHandler(BaseHTTPRequestHandler):
             assets = []
             if os.path.exists(OUTPUT_DIR):
                 files = sorted(os.listdir(OUTPUT_DIR), key=lambda x: os.path.getmtime(os.path.join(OUTPUT_DIR, x)), reverse=True)
-                # Find all unique prefixes
                 seen_prefixes = set()
                 for f in files:
                     if f.endswith("_anim_00001_.png") or f.endswith("_spritesheet_00001_.png"):
@@ -1289,7 +1399,6 @@ class StudioHandler(BaseHTTPRequestHandler):
                             continue
                         seen_prefixes.add(prefix)
 
-                        # Parts
                         parts = prefix.split("_", 1)
                         char_tag = parts[0]
                         action_tag = parts[1] if len(parts) > 1 else prefix
@@ -1375,15 +1484,17 @@ class StudioHandler(BaseHTTPRequestHandler):
             char_name = data.get("char_name", "hero")
             char_desc = data.get("char_desc", "")
             seed = int(data.get("seed", 424242))
-            style = data.get("style", "16-bit Retro Pixel Art")
+            style = data.get("style", "Smooth HD Vector Art")
             output_style = data.get("output_style", "standard")
             is_creature = bool(data.get("is_creature", False))
             selected_moves = data.get("selected_moves", [])
+            fw = int(data.get("frame_width", 256))
+            fh = int(data.get("frame_height", 256))
 
             queued = []
             for move in selected_moves:
                 custom_p = move.get("custom_prompt")
-                prompt_dict = build_character_graph(char_desc, move, is_creature, style, output_style, seed, char_name, custom_p)
+                prompt_dict = build_character_graph(char_desc, move, is_creature, style, output_style, seed, char_name, custom_p, fw, fh)
                 try:
                     pid = send_to_comfy(prompt_dict)
                     queued.append(pid)
@@ -1406,13 +1517,15 @@ class StudioHandler(BaseHTTPRequestHandler):
             char_name = data.get("char_name", "hero")
             char_desc = data.get("char_desc", "")
             seed = int(data.get("seed", 424242))
-            style = data.get("style", "16-bit Retro Pixel Art")
+            style = data.get("style", "Smooth HD Vector Art")
             output_style = data.get("output_style", "standard")
             is_creature = bool(data.get("is_creature", False))
             action_item = data.get("action_item", {})
             custom_p = data.get("custom_prompt")
+            fw = int(data.get("frame_width", 256))
+            fh = int(data.get("frame_height", 256))
 
-            prompt_dict = build_character_graph(char_desc, action_item, is_creature, style, output_style, seed, char_name, custom_p)
+            prompt_dict = build_character_graph(char_desc, action_item, is_creature, style, output_style, seed, char_name, custom_p, fw, fh)
             pid = send_to_comfy(prompt_dict)
 
             self.send_response(200)
@@ -1427,9 +1540,12 @@ class StudioHandler(BaseHTTPRequestHandler):
 
             vfx_name = data.get("vfx_name", "vfx")
             vfx_desc = data.get("vfx_desc", "energy fireball projectile")
+            style = data.get("style", "Smooth HD Vector Art")
             seed = int(data.get("seed", 987654))
+            fw = int(data.get("frame_width", 256))
+            fh = int(data.get("frame_height", 256))
 
-            prompt_dict = build_vfx_graph(vfx_desc, vfx_name, seed, "vfx")
+            prompt_dict = build_vfx_graph(vfx_desc, vfx_name, style, seed, "vfx", fw, fh)
             pid = send_to_comfy(prompt_dict)
 
             self.send_response(200)
