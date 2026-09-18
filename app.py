@@ -1,34 +1,40 @@
 """
-2D Sprite, Animation & VFX Studio Web Application
-Full 52-Move Character Moveset + Non-Humanoids + Custom Moves + VFX Studio + Asset Library
-Supports:
-- Custom Sprite Sizes (64x64, 128x128, 256x256, 512x512, Custom WxH)
-- Normal Detailed 2D & Smooth Vector Art (Non-pixel) + Retro Pixel Art
-- Single Clean Output (No unwanted retro duplicates)
-- Re-run individual animations with custom seed/prompt
-- One-click ZIP download and individual asset downloads
-- AMD Radeon RX 9060 XT (ROCm) / ComfyUI integration
+🎮 2D Sprite, Animation & VFX Studio
+A unified web app for generating 52-move game animations, 2D VFX, projectiles, and particle sheets
+Powered by ComfyUI (Z-Image Turbo + BiRefNet Toonout) on AMD Radeon RX (ROCm) & NVIDIA CUDA.
+Supports Local LLM Prompt Optimization (Ollama) & Reference Image Conditioning.
 """
 
-import sys
 import os
+import sys
 import json
 import time
-import zipfile
-import subprocess
+import uuid
+import base64
 import urllib.request
+import urllib.parse
 import urllib.error
+import zipfile
+import threading
+import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Windows console UTF-8 fix
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
 COMFY_URL = "http://127.0.0.1:8188"
+OLLAMA_URL = "http://127.0.0.1:11434"
 PORT = 8190
+
 SHARED_DIR = r"C:\Users\USER\AppData\Local\Comfy-Desktop\ComfyUI-Shared"
 OUTPUT_DIR = os.path.join(SHARED_DIR, "output")
+INPUT_DIR = os.path.join(SHARED_DIR, "input")
+COMFY_INPUT_DIR = r"C:\Users\USER\AppData\Local\Comfy-Desktop\ComfyUI-Installs\ComfyUI\ComfyUI\input"
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(INPUT_DIR, exist_ok=True)
+if os.path.exists(COMFY_INPUT_DIR):
+    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
 
 # 52 Base Animations
 DEFAULT_52_ANIMATIONS = [
@@ -240,44 +246,214 @@ VFX_PRESETS = [
 ]
 
 
-def build_character_graph(char_desc, action_item, is_creature, style, output_style, seed, char_name, custom_action_prompt=None, frame_width=256, frame_height=256):
-    """Builds the ComfyUI workflow JSON for a character animation with customizable size and rendering medium."""
+# ============================================================
+# Background Job & Queue Manager
+# ============================================================
+class JobManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.is_running = False
+        self.batch_id = ""
+        self.batch_name = ""
+        self.jobs = []  # list of {"pid": str, "id": str, "name": str, "status": "queued"|"running"|"done"|"error", "preview_url": str}
+        self.total_jobs = 0
+        self.completed_count = 0
+        self.current_job_name = ""
+        self.current_job_id = ""
+        self.latest_preview = None
+        self.thread = None
+
+    def start_batch(self, batch_id, name, jobs):
+        with self.lock:
+            self.batch_id = batch_id
+            self.batch_name = name
+            self.jobs = jobs
+            self.total_jobs = len(jobs)
+            self.completed_count = 0
+            self.is_running = True
+            self.current_job_name = jobs[0]["name"] if jobs else ""
+            self.current_job_id = jobs[0]["id"] if jobs else ""
+            self.latest_preview = None
+
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.thread.start()
+
+    def cancel_batch(self):
+        with self.lock:
+            self.is_running = False
+            self.jobs = []
+            self.total_jobs = 0
+            self.completed_count = 0
+            self.current_job_name = ""
+            self.current_job_id = ""
+
+        # Send interrupt and clear queue to ComfyUI
+        try:
+            req1 = urllib.request.Request(f"{COMFY_URL}/queue", data=json.dumps({"clear": True}).encode(), headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req1, timeout=2)
+            req2 = urllib.request.Request(f"{COMFY_URL}/interrupt", data=b"")
+            urllib.request.urlopen(req2, timeout=2)
+        except Exception:
+            pass
+
+    def get_status(self):
+        with self.lock:
+            completed_ids = [j["id"] for j in self.jobs if j["status"] == "done"]
+            pct = 0
+            if self.total_jobs > 0:
+                pct = min(100, int((self.completed_count / self.total_jobs) * 100))
+
+            return {
+                "is_running": self.is_running,
+                "total_queued": self.total_jobs,
+                "completed_count": self.completed_count,
+                "percent": pct,
+                "current_move": self.current_job_name,
+                "current_id": self.current_job_id,
+                "completed_ids": completed_ids,
+                "latest_preview": self.latest_preview,
+                "batch_name": self.batch_name
+            }
+
+    def _monitor_loop(self):
+        while True:
+            time.sleep(1.2)
+            with self.lock:
+                if not self.is_running or not self.jobs:
+                    continue
+
+                # Query running jobs from ComfyUI /queue
+                running_pids = set()
+                try:
+                    with urllib.request.urlopen(f"{COMFY_URL}/queue", timeout=2) as r:
+                        q_data = json.loads(r.read().decode())
+                        for item in q_data.get("queue_running", []):
+                            if len(item) > 1:
+                                running_pids.add(item[1])
+                except Exception:
+                    pass
+
+                completed_now = 0
+                found_running = False
+
+                for job in self.jobs:
+                    pid = job["pid"]
+                    if job["status"] == "done":
+                        completed_now += 1
+                        continue
+
+                    if pid in running_pids:
+                        job["status"] = "running"
+                        self.current_job_name = job["name"]
+                        self.current_job_id = job["id"]
+                        found_running = True
+                        continue
+
+                    # Check ComfyUI history
+                    try:
+                        with urllib.request.urlopen(f"{COMFY_URL}/history/{pid}", timeout=2) as r:
+                            h = json.loads(r.read().decode())
+                            if pid in h:
+                                status = h[pid].get("status", {}).get("status_str", "")
+                                if status == "success":
+                                    job["status"] = "done"
+                                    completed_now += 1
+                                    # Output file check
+                                    prefix = f"{self.batch_name}_{job['id']}"
+                                    anim_name = f"{prefix}_anim_00001_.png"
+                                    if os.path.exists(os.path.join(OUTPUT_DIR, anim_name)):
+                                        self.latest_preview = f"/output/{anim_name}"
+                                        job["preview_url"] = self.latest_preview
+                                else:
+                                    job["status"] = "error"
+                                    completed_now += 1
+                    except Exception:
+                        pass
+
+                self.completed_count = completed_now
+
+                # Update current active job display
+                if not found_running:
+                    for job in self.jobs:
+                        if job["status"] == "queued":
+                            self.current_job_name = job["name"]
+                            self.current_job_id = job["id"]
+                            break
+
+                if completed_now >= self.total_jobs and self.total_jobs > 0:
+                    self.is_running = False
+                    self.current_job_name = "All Animations Complete!"
+                    self.current_job_id = ""
+
+
+GLOBAL_JOB_MGR = JobManager()
+
+
+# ============================================================
+# ComfyUI Workflow Construction
+# ============================================================
+def build_character_graph(char_desc, action_item, is_creature, style, output_style, seed, char_name, custom_action_prompt=None, frame_width=256, frame_height=256, ref_image=None):
+    """Builds the ComfyUI workflow JSON for a character animation with optional reference image and rendering medium."""
     if custom_action_prompt and custom_action_prompt.strip():
         action_desc = custom_action_prompt.strip()
     else:
         action_desc = action_item["creature"] if is_creature else action_item["human"]
 
     prefix = f"{char_name}_{action_item['id']}"
-    fps = float(action_item.get("fps", 6.0))
+    fps = action_item.get("fps", 6.0)
 
-    # Determine if pixel art or smooth detailed/vector 2D
+    # Rendering medium styles
     is_pixel_style = "Pixel Art" in style or "NES" in style
 
-    style_prompts = {
-        "Smooth HD Vector Art": "smooth clean vector 2d game art, crisp sharp outlines, solid flat color fills, modern indie game sprite, high resolution, no pixel art, no noise",
-        "Detailed Hand-Drawn 2D": "detailed hand-drawn 2d arcade fighting game sprite, crisp ink linework, professional cel-shading, dynamic anatomy, high resolution 2d game asset, no pixel art",
-        "Detailed Painterly 2D": "detailed painterly 2d fantasy game sprite, rich textures, dramatic rim lighting, intricate concept art illustration, high resolution, no pixel art",
-        "Western Cartoon Brawler": "expressive 2d cartoon brawler sprite, bold fluid ink outlines, vibrant cel-shaded color palette, clean modern 2d animation, no pixel art",
-        "16-bit Retro Pixel Art": "clean 16-bit retro pixel art game sprite, bold pixel outlines, classic SNES arcade game sprite",
-        "8-bit Classic NES": "authentic 8-bit retro pixel art, restricted retro palette, crisp retro pixel grid"
-    }
-    style_str = style_prompts.get(style, style_prompts["Smooth HD Vector Art"])
-
-    if is_pixel_style:
-        medium_header = "pixel art 2d sprite sheet of"
-        neg_prompt = "3d render, photorealistic, noise, gradients, complex background, blurry, overlapping frames, text, watermark"
+    if "Vector" in style:
+        style_prompt = (
+            "smooth clean vector 2d game art, crisp sharp outlines, solid flat color fills, "
+            "modern indie game sprite, high resolution, no pixel art, no noise"
+        )
+        neg_style = "pixel art, pixelated, 8-bit, 16-bit, chunky pixels, mosaic, 3d render, photorealistic, noise, complex background"
+    elif "Hand-Drawn" in style:
+        style_prompt = (
+            "detailed hand-drawn 2d arcade fighting game sprite, rich cell shading, dynamic comic linework, "
+            "vibrant colors, clean sharp edges, no pixelation"
+        )
+        neg_style = "pixel art, pixelated, low resolution, 3d render, photorealistic, noise, blurry, messy background"
+    elif "Painterly" in style:
+        style_prompt = (
+            "painterly stylized 2d concept art sprite, beautiful digital brush strokes, rich lighting, "
+            "clean silhouette, high detail fantasy illustration"
+        )
+        neg_style = "pixel art, pixelated, low resolution, photorealistic, photo, messy outlines"
+    elif "Western Cartoon" in style:
+        style_prompt = (
+            "expressive western cartoon 2d animation sprite, bold inked outlines, fluid squash and stretch poses, "
+            "solid vibrant cel animation colors"
+        )
+        neg_style = "pixel art, pixelated, 3d render, photorealistic, gritty, noise"
+    elif "8-bit" in style or "NES" in style:
+        style_prompt = (
+            "authentic 8-bit retro NES pixel art sprite, restricted 4-color palette, chunky square pixels, "
+            "sharp crisp pixel boundaries"
+        )
+        neg_style = "blurry, smooth vector, anti-aliased, 3d render, photorealistic, modern gradients"
     else:
-        medium_header = "clean high-quality 2d game sprite sheet of"
-        neg_prompt = "pixel art, pixelated, 8-bit, 16-bit, chunky pixels, mosaic, 3d render, photorealistic, noise, complex background, blurry, overlapping frames, text, watermark"
+        # Default: 16-bit Retro Pixel Art
+        style_prompt = (
+            "classic 16-bit arcade video game sprite, authentic pixel art, clean pixel grid, "
+            "crisp black outline, vibrant retro colors"
+        )
+        neg_style = "photorealistic, 3d render, blurry, messy outlines, noise, complex background"
 
     pos_prompt = (
-        f"{medium_header} {char_desc}, "
+        f"clean high-quality 2d game sprite sheet of {char_desc}, "
         f"4 animation frames in a horizontal sequence, "
-        f"{action_desc}, {style_str}, "
+        f"{action_desc}, "
+        f"{style_prompt}, "
         f"flat solid pure white background, distinct separated frames, full body"
     )
 
-    # Calculate canvas dimensions for 4 frames
+    neg_prompt = f"{neg_style}, blurry, overlapping frames, text, watermark"
+
     canvas_w = int(frame_width) * 4
     canvas_h = int(frame_height)
 
@@ -285,8 +461,6 @@ def build_character_graph(char_desc, action_item, is_creature, style, output_sty
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "z_image_turbo_bf16.safetensors", "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_4b.safetensors", "type": "qwen_image"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": "z-image-ae.safetensors"}},
-        "4": {"class_type": "TextEncodeZImageOmni", "inputs": {"prompt": pos_prompt, "auto_resize_images": True, "clip": ["2", 0]}},
-        "5": {"class_type": "TextEncodeZImageOmni", "inputs": {"prompt": neg_prompt, "auto_resize_images": True, "clip": ["2", 0]}},
         "6": {"class_type": "EmptyLatentImage", "inputs": {"width": canvas_w, "height": canvas_h, "batch_size": 1}},
         "7": {"class_type": "KSampler", "inputs": {
             "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0],
@@ -302,6 +476,25 @@ def build_character_graph(char_desc, action_item, is_creature, style, output_sty
         "11": {"class_type": "RebatchImages", "inputs": {"images": ["10", 0], "batch_size": 4}},
     }
 
+    # Reference Image Conditioning (Optional)
+    if ref_image and ref_image.strip():
+        # Node 20: LoadImage, Node 21: Scale to 512x512 (guaranteeing exact even latent dimensions for Lumina/Z-Image)
+        graph["20"] = {"class_type": "LoadImage", "inputs": {"image": ref_image.strip()}}
+        graph["21"] = {"class_type": "ImageScale", "inputs": {"image": ["20", 0], "upscale_method": "area", "width": 512, "height": 512, "crop": "disabled"}}
+        graph["4"] = {"class_type": "TextEncodeZImageOmni", "inputs": {
+            "clip": ["2", 0], "prompt": pos_prompt, "auto_resize_images": False, "vae": ["3", 0], "image1": ["21", 0]
+        }}
+        graph["5"] = {"class_type": "TextEncodeZImageOmni", "inputs": {
+            "clip": ["2", 0], "prompt": neg_prompt, "auto_resize_images": False
+        }}
+    else:
+        graph["4"] = {"class_type": "TextEncodeZImageOmni", "inputs": {
+            "clip": ["2", 0], "prompt": pos_prompt, "auto_resize_images": True
+        }}
+        graph["5"] = {"class_type": "TextEncodeZImageOmni", "inputs": {
+            "clip": ["2", 0], "prompt": neg_prompt, "auto_resize_images": True
+        }}
+
     # Output selection (single clean output by default)
     if output_style == "retro" and is_pixel_style:
         down_w = max(16, int(frame_width) // 4)
@@ -310,6 +503,18 @@ def build_character_graph(char_desc, action_item, is_creature, style, output_sty
         graph["15"] = {"class_type": "ImageScale", "inputs": {"image": ["14", 0], "upscale_method": "nearest-exact", "width": int(frame_width), "height": int(frame_height), "crop": "disabled"}}
         graph["16"] = {"class_type": "SaveAnimatedPNG", "inputs": {"images": ["15", 0], "filename_prefix": f"{prefix}_anim", "fps": fps, "compress_level": 4}}
         graph["17"] = {"class_type": "ImageGrid", "inputs": {"images": ["15", 0], "columns": 4, "cell_width": int(frame_width), "cell_height": int(frame_height), "padding": 0}}
+        graph["18"] = {"class_type": "SaveImage", "inputs": {"images": ["17", 0], "filename_prefix": f"{prefix}_spritesheet"}}
+    elif output_style == "both" and is_pixel_style:
+        # Standard clean
+        graph["12"] = {"class_type": "SaveAnimatedPNG", "inputs": {"images": ["11", 0], "filename_prefix": f"{prefix}_anim", "fps": fps, "compress_level": 4}}
+        graph["13"] = {"class_type": "SaveAnimatedWEBP", "inputs": {"images": ["11", 0], "filename_prefix": f"{prefix}_webp", "fps": fps, "lossless": True, "quality": 90, "method": "default"}}
+        # Retro snap
+        down_w = max(16, int(frame_width) // 4)
+        down_h = max(16, int(frame_height) // 4)
+        graph["14"] = {"class_type": "ImageScale", "inputs": {"image": ["11", 0], "upscale_method": "nearest-exact", "width": down_w, "height": down_h, "crop": "disabled"}}
+        graph["15"] = {"class_type": "ImageScale", "inputs": {"image": ["14", 0], "upscale_method": "nearest-exact", "width": int(frame_width), "height": int(frame_height), "crop": "disabled"}}
+        graph["16"] = {"class_type": "SaveAnimatedPNG", "inputs": {"images": ["15", 0], "filename_prefix": f"{prefix}_retro_anim", "fps": fps, "compress_level": 4}}
+        graph["17"] = {"class_type": "ImageGrid", "inputs": {"images": ["11", 0], "columns": 4, "cell_width": int(frame_width), "cell_height": int(frame_height), "padding": 0}}
         graph["18"] = {"class_type": "SaveImage", "inputs": {"images": ["17", 0], "filename_prefix": f"{prefix}_spritesheet"}}
     else:
         # Standard clean output (Smooth Vector, Detailed 2D, or Clean Pixel Art)
@@ -324,7 +529,7 @@ def build_character_graph(char_desc, action_item, is_creature, style, output_sty
 def build_vfx_graph(vfx_desc, vfx_id, style, seed, name_prefix, frame_width=256, frame_height=256):
     """Builds the ComfyUI workflow JSON for a 2D VFX / Projectile / Particle animation."""
     prefix = f"{name_prefix}_{vfx_id}"
-    is_pixel = "Pixel Art" in style
+    is_pixel = "Pixel Art" in style or "NES" in style
 
     if is_pixel:
         header = "pixel art 2d sprite sheet of"
@@ -377,15 +582,65 @@ def send_to_comfy(prompt_dict):
         data=json.dumps({"prompt": prompt_dict}).encode("utf-8"),
         headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))["prompt_id"]
 
 
+# ============================================================
+# Local LLM Prompt Optimizer (Ollama)
+# ============================================================
+def query_ollama(prompt, system=""):
+    """Queries local Ollama instance (qwen2.5:3b or fallback)"""
+    model_to_use = "qwen2.5:3b"
+    try:
+        # Check available models
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=1.5) as r:
+            tags = json.loads(r.read().decode())
+            available = [m["name"].split(":")[0] for m in tags.get("models", [])]
+            if "qwen2.5" in available or "qwen2.5:3b" in available:
+                model_to_use = "qwen2.5:3b"
+            elif len(available) > 0:
+                model_to_use = tags["models"][0]["name"]
+    except Exception:
+        pass
+
+    payload = {
+        "model": model_to_use,
+        "prompt": prompt,
+        "system": system,
+        "stream": False,
+        "options": {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "num_predict": 128
+        }
+    }
+
+    try:
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            out = data.get("response", "").strip()
+            # Clean up quotes
+            if out.startswith('"') and out.endswith('"'):
+                out = out[1:-1].strip()
+            return out, model_to_use
+    except Exception as e:
+        return None, str(e)
+
+
+# ============================================================
+# Web UI HTML + CSS + Vanilla JS
+# ============================================================
 HTML_STUDIO = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>2D Sprite & VFX Studio</title>
+<title>2D Sprite & VFX Studio (AMD ROCm / CUDA)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
 :root {
@@ -393,12 +648,14 @@ HTML_STUDIO = """<!DOCTYPE html>
   --bg-card: #131b2e;
   --bg-item: #1a253d;
   --border: #233354;
+  --border-focus: #38bdf8;
   --text-main: #f8fafc;
   --text-muted: #94a3b8;
   --accent: #38bdf8;
   --accent-glow: rgba(56, 189, 248, 0.25);
   --success: #10b981;
   --purple: #c084fc;
+  --warning: #f59e0b;
   --danger: #f43f5e;
 }
 
@@ -420,6 +677,8 @@ header {
 .logo { font-size: 20px; font-weight: 800; color: #fff; display: flex; align-items: center; gap: 10px; }
 .logo span { color: var(--accent); }
 .badge { background: #0284c7; color: #fff; font-size: 11px; padding: 3px 8px; border-radius: 6px; text-transform: uppercase; font-weight: 700; }
+.badge-ai { background: #7e22ce; color: #f3e8ff; font-size: 11px; padding: 3px 8px; border-radius: 6px; font-weight: 700; display: inline-flex; align-items: center; gap: 4px; }
+.dot-live { width: 7px; height: 7px; background: #10b981; border-radius: 50%; display: inline-block; box-shadow: 0 0 8px #10b981; }
 
 .nav-tabs { display: flex; gap: 8px; }
 .nav-tab {
@@ -442,7 +701,7 @@ header {
 .tab-content { display: none; }
 .tab-content.active { display: block; }
 
-.container { max-width: 1380px; margin: 24px auto; padding: 0 20px; }
+.container { max-width: 1420px; margin: 24px auto; padding: 0 20px; }
 .grid-layout { display: grid; grid-template-columns: 460px 1fr; gap: 24px; }
 
 .panel {
@@ -451,61 +710,105 @@ header {
   border-radius: 12px;
   padding: 20px;
 }
+.panel-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
 
-h2 { font-size: 16px; font-weight: 700; color: #fff; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
-
-.form-group { margin-bottom: 14px; }
-label { display: block; font-size: 11px; font-weight: 700; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
-input[type="text"], input[type="number"], textarea, select {
+.form-group { margin-bottom: 16px; }
+.form-group label { display: block; font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+input[type="text"], input[type="number"], select, textarea {
   width: 100%;
   background: var(--bg-item);
   border: 1px solid var(--border);
   border-radius: 8px;
-  color: #fff;
   padding: 10px 12px;
+  color: #fff;
   font-size: 13px;
   outline: none;
-  transition: border-color 0.2s;
+  transition: border 0.2s, box-shadow 0.2s;
 }
-input[type="text"]:focus, input[type="number"]:focus, textarea:focus, select:focus { border-color: var(--accent); }
-textarea { resize: vertical; min-height: 75px; }
+input[type="text"]:focus, select:focus, textarea:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+textarea { resize: vertical; min-height: 80px; }
 
-.radio-pill-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.radio-pill {
+/* Reference Image Box */
+.ref-image-box {
   background: var(--bg-item);
-  border: 1px solid var(--border);
+  border: 2px dashed var(--border);
   border-radius: 8px;
-  padding: 10px;
+  padding: 12px;
   text-align: center;
   cursor: pointer;
-  font-size: 13px;
-  font-weight: 600;
   transition: all 0.2s;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
+  position: relative;
 }
-.radio-pill input { display: none; }
-.radio-pill.active { background: #0369a1; border-color: var(--accent); color: #fff; box-shadow: 0 0 12px var(--accent-glow); }
-.radio-pill small { font-size: 10px; font-weight: 400; opacity: 0.8; }
+.ref-image-box:hover { border-color: var(--accent); background: rgba(56, 189, 248, 0.05); }
+.ref-preview-wrap { display: flex; align-items: center; gap: 12px; text-align: left; }
+.ref-preview-img { width: 64px; height: 64px; object-fit: contain; background: #000; border-radius: 6px; border: 1px solid var(--border); }
+.ref-info { flex: 1; min-width: 0; }
+.ref-filename { font-size: 12px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ref-tag { font-size: 11px; color: var(--success); font-weight: 600; }
+.btn-remove-ref { background: #e11d48; color: #fff; border: none; border-radius: 6px; padding: 4px 8px; font-size: 11px; cursor: pointer; }
 
-.btn-trigger {
+/* Anatomy toggle */
+.anatomy-toggle { display: flex; background: var(--bg-item); border-radius: 8px; p-1: 3px; border: 1px solid var(--border); }
+.pill-btn {
+  flex: 1;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.pill-btn.active { background: #0284c7; color: #fff; box-shadow: 0 0 10px var(--accent-glow); }
+
+/* Buttons */
+.btn-primary {
   width: 100%;
   background: linear-gradient(135deg, #0284c7, #2563eb);
   color: #fff;
   border: none;
-  border-radius: 10px;
-  padding: 14px;
-  font-size: 15px;
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 14px;
   font-weight: 700;
   cursor: pointer;
-  box-shadow: 0 4px 15px var(--accent-glow);
-  transition: transform 0.1s, opacity 0.2s;
-  margin-top: 10px;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
 }
-.btn-trigger:hover { opacity: 0.95; transform: translateY(-1px); }
-.btn-trigger:active { transform: translateY(1px); }
+.btn-primary:hover { opacity: 0.95; transform: translateY(-1px); box-shadow: 0 0 16px var(--accent-glow); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+
+.btn-ai {
+  background: linear-gradient(135deg, #7e22ce, #9333ea);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: all 0.2s;
+}
+.btn-ai:hover { opacity: 0.9; box-shadow: 0 0 8px rgba(168, 85, 247, 0.4); }
 
 .btn-sm {
   background: var(--bg-item);
@@ -514,359 +817,436 @@ textarea { resize: vertical; min-height: 75px; }
   border-radius: 6px;
   padding: 5px 10px;
   font-size: 11px;
-  cursor: pointer;
   font-weight: 600;
-  transition: all 0.15s;
-  text-decoration: none;
-  display: inline-block;
+  cursor: pointer;
+  transition: all 0.2s;
 }
 .btn-sm:hover { color: #fff; border-color: var(--accent); }
-.btn-sm.btn-danger:hover { color: #fff; border-color: var(--danger); background: #881337; }
+.btn-danger { background: #e11d48; color: #fff; border-color: #f43f5e; }
+.btn-danger:hover { background: #be123c; }
 
-.anim-selector-bar {
+/* Status Bar with live preview */
+.status-bar {
+  background: var(--bg-item);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  margin-top: 16px;
+}
+.status-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-weight: 600; font-size: 13px; }
+.progress-bg { background: #0b1120; border-radius: 6px; height: 10px; overflow: hidden; position: relative; margin-bottom: 10px; }
+.progress-fill {
+  background: linear-gradient(90deg, #0284c7, #38bdf8);
+  height: 100%;
+  width: 0%;
+  transition: width 0.3s;
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+.status-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(0,0,0,0.3);
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.05);
+}
+.status-preview-img { width: 44px; height: 44px; object-fit: contain; background: #111; border-radius: 4px; }
+.status-action-title { font-size: 12px; font-weight: 700; color: var(--accent); }
+.status-action-desc { font-size: 11px; color: var(--text-muted); }
+
+/* Moves grid */
+.moves-toolbar {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 12px;
-  gap: 8px;
   flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
 }
+.cat-filters { display: flex; gap: 6px; flex-wrap: wrap; }
+.cat-btn {
+  background: var(--bg-item);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.cat-btn.active { background: #0284c7; color: #fff; border-color: var(--accent); }
 
 .anim-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 10px;
-  max-height: 680px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+  max-height: 720px;
   overflow-y: auto;
   padding-right: 6px;
 }
+.anim-grid::-webkit-scrollbar { width: 6px; }
+.anim-grid::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
 .anim-card {
   background: var(--bg-item);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 10px 12px;
-  transition: all 0.15s;
+  padding: 10px;
+  transition: all 0.2s;
+  position: relative;
 }
-.anim-card.selected { border-color: var(--accent); background: #132742; }
-.anim-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
-.anim-title { font-size: 13px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px; }
-.anim-title input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
-.anim-cat { font-size: 10px; color: var(--text-muted); }
+.anim-card.selected { border-color: rgba(56, 189, 248, 0.4); }
+.anim-card.running { border-color: var(--accent); box-shadow: 0 0 12px var(--accent-glow); background: rgba(56, 189, 248, 0.08); }
+.anim-card.done { border-color: rgba(16, 185, 129, 0.5); }
+
+.anim-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.anim-title { font-size: 12px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.anim-cat { font-size: 10px; color: var(--text-muted); background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px; }
 .anim-prompt-box {
   width: 100%;
-  background: #0d1526;
-  border: 1px solid #1e293b;
-  border-radius: 6px;
-  padding: 6px 8px;
+  height: 52px;
   font-size: 11px;
   color: #cbd5e1;
-  outline: none;
-  resize: none;
-  height: 42px;
-}
-.anim-prompt-box:focus { border-color: var(--accent); }
-
-.status-bar {
-  margin-top: 16px;
-  background: #0a1120;
+  background: rgba(0,0,0,0.3);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
-  font-size: 12px;
+  border-radius: 4px;
+  padding: 6px;
+  resize: none;
 }
-.status-header { display: flex; justify-content: space-between; margin-bottom: 6px; font-weight: 600; }
-.progress-track { height: 6px; background: #334155; border-radius: 3px; overflow: hidden; }
-.progress-fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.3s; }
+.card-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+.card-badge-status { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px; }
+.badge-done { background: rgba(16, 185, 129, 0.2); color: #10b981; }
+.badge-running { background: rgba(56, 189, 248, 0.2); color: #38bdf8; animation: pulse 1.2s infinite; }
 
-/* Asset Library */
-.library-filters {
-  display: flex;
-  gap: 12px;
-  margin-bottom: 20px;
-  align-items: center;
-  flex-wrap: wrap;
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
+
+/* Asset Library Tab */
 .library-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 16px;
+  margin-top: 16px;
 }
 .asset-card {
   background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  transition: transform 0.15s, border-color 0.15s;
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
-.asset-card:hover { border-color: var(--accent); transform: translateY(-2px); }
 .asset-preview {
-  width: 100%;
-  height: 180px;
-  object-fit: contain;
-  background: repeating-conic-gradient(#1a263d 0% 25%, #0e1626 0% 50%) 50% / 16px 16px;
-  display: block;
+  width: 160px;
+  height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin-bottom: 12px;
+  overflow: hidden;
 }
-.asset-body { padding: 12px; }
-.asset-title { font-size: 13px; font-weight: 700; color: #fff; margin-bottom: 4px; word-break: break-all; }
-.asset-meta { font-size: 11px; color: var(--text-muted); margin-bottom: 10px; display: flex; justify-content: space-between; }
-.asset-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.asset-preview img { max-width: 100%; max-height: 100%; object-fit: contain; image-rendering: pixelated; }
+.asset-title { font-size: 13px; font-weight: 700; color: #fff; margin-bottom: 2px; text-align: center; }
+.asset-meta { font-size: 11px; color: var(--text-muted); margin-bottom: 10px; }
+.asset-btn-row { display: flex; gap: 6px; width: 100%; }
+.asset-btn-row a, .asset-btn-row button {
+  flex: 1;
+  text-align: center;
+  font-size: 11px;
+  padding: 6px;
+  border-radius: 6px;
+  text-decoration: none;
+  font-weight: 600;
+}
+.btn-dl { background: #0284c7; color: #fff; }
+.btn-dl:hover { background: #0369a1; }
+.btn-del { background: transparent; border: 1px solid #e11d48; color: #e11d48; cursor: pointer; }
+.btn-del:hover { background: #e11d48; color: #fff; }
+
+/* Modals */
+.modal-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.75);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+.modal-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: 520px;
+  padding: 24px;
+}
+.modal-title { font-size: 16px; font-weight: 700; margin-bottom: 16px; color: #fff; }
 </style>
 </head>
 <body>
 
 <header>
   <div class="logo">
-    👾 <span>SpriteStudio</span> AI
-    <span class="badge">AMD ROCm RX 9060 XT</span>
+    <span>👾 2D SPRITE</span> & VFX STUDIO
+    <span class="badge">AMD ROCm</span>
+    <span class="badge-ai" id="aiStatusBadge"><span class="dot-live"></span> Ollama Qwen2.5</span>
   </div>
-
   <div class="nav-tabs">
     <button class="nav-tab active" onclick="switchTab('tabCharacter')">🎮 Character Studio (52 Moves)</button>
     <button class="nav-tab" onclick="switchTab('tabVFX')">✨ VFX & Projectiles</button>
     <button class="nav-tab" onclick="switchTab('tabLibrary')">📦 Asset Library</button>
   </div>
-
-  <div style="display:flex; gap:10px;">
-    <button class="btn-sm" onclick="openOutputFolder()">📂 Open Output Folder</button>
-  </div>
 </header>
 
 <div class="container">
-  <!-- TAB 1: CHARACTER STUDIO -->
-  <div class="tab-content active" id="tabCharacter">
+
+  <!-- ================= CHARACTER STUDIO TAB ================= -->
+  <div id="tabCharacter" class="tab-content active">
     <div class="grid-layout">
-      <!-- Left Config -->
+      <!-- Left Config Panel -->
       <div class="panel">
-        <h2>1. Character Configuration</h2>
-
-        <div class="form-group">
-          <label>Character Name / Tag</label>
-          <input type="text" id="charName" value="shadow_ninja" placeholder="e.g. cyber_wolf, flame_mage">
+        <div class="panel-title">
+          <span>Character Profile</span>
+          <span class="badge" id="countBadge">52 Selected</span>
         </div>
 
         <div class="form-group">
-          <label>Visual Description</label>
-          <textarea id="charDesc" placeholder="Describe outfit, armor, weapons, colors, fur, silhouette...">a swift cyberpunk shadow ninja with glowing neon blue scarf, dark stealth suit, and dual energetic katanas</textarea>
+          <label>Character Name (Asset Prefix)</label>
+          <input type="text" id="charName" value="shadow_ninja" placeholder="e.g. shadow_ninja, flame_golem">
         </div>
 
         <div class="form-group">
-          <label>Anatomy & Movement Mode</label>
-          <div class="radio-pill-group">
-            <label class="radio-pill active" id="pillHuman">
-              <input type="radio" name="anatomy" value="human" checked onchange="toggleAnatomy(false)">
-              <span>👤 Humanoid</span>
-              <small>Punches, kicks, weapons</small>
-            </label>
-            <label class="radio-pill" id="pillCreature">
-              <input type="radio" name="anatomy" value="creature" onchange="toggleAnatomy(true)">
-              <span>🐾 Non-Humanoid</span>
-              <small>Claws, bites, tail, pounces</small>
-            </label>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+            <label style="margin:0;">Character Description</label>
+            <button class="btn-ai" onclick="optimizeCharacterPrompt()" title="Enhance prompt with Local Ollama AI">✨ AI Enhance</button>
+          </div>
+          <textarea id="charDesc" placeholder="Describe the character...">a swift cyberpunk shadow ninja with glowing neon blue scarf, dark stealth suit, and dual energetic katanas</textarea>
+        </div>
+
+        <!-- Reference Image Upload (Optional) -->
+        <div class="form-group">
+          <label>Reference Character Image (Optional)</label>
+          <input type="file" id="refImageInput" accept="image/*" style="display:none;" onchange="handleRefUpload(this)">
+          <div class="ref-image-box" id="refDropBox" onclick="document.getElementById('refImageInput').click()">
+            <div id="refEmptyPrompt">
+              <span style="font-size:24px;">📁</span>
+              <p style="font-size:12px; color:var(--text-muted); margin-top:4px;">Click or drag to attach character reference image</p>
+              <p style="font-size:10px; color:var(--accent);">Anchors all 52 animation moves to this visual design</p>
+            </div>
+            <div id="refLoadedRow" class="ref-preview-wrap" style="display:none;">
+              <img id="refThumb" class="ref-preview-img" src="" alt="Ref">
+              <div class="ref-info">
+                <div class="ref-filename" id="refFilename">image.png</div>
+                <div class="ref-tag">✓ Anchoring 52 Moves to Reference</div>
+              </div>
+              <button class="btn-remove-ref" onclick="removeReferenceImage(event)">✕</button>
+            </div>
           </div>
         </div>
 
         <div class="form-group">
-          <label>Art Medium & Rendering Style</label>
+          <label>Art Medium / Rendering Style</label>
           <select id="artStyle" onchange="updateStyleNotice()">
-            <option value="Smooth HD Vector Art" selected>Smooth HD Vector Art (Clean flat 2D, No pixels - Hollow Knight style)</option>
-            <option value="Detailed Hand-Drawn 2D">Detailed Hand-Drawn 2D (Arcade fighting game, sharp cel-shaded lines)</option>
-            <option value="Detailed Painterly 2D">Detailed Painterly 2D (Rich textures, rim lighting, Castlevania/Darkest Dungeon)</option>
-            <option value="Western Cartoon Brawler">Western Cartoon Brawler (Expressive outlines, Cuphead/TMNT style)</option>
-            <option value="16-bit Retro Pixel Art">16-bit Retro Pixel Art (Classic SNES/Arcade pixel blocks)</option>
-            <option value="8-bit Classic NES">8-bit Classic NES (Chunky retro pixels, restricted palette)</option>
+            <option value="Smooth HD Vector Art" selected>Smooth HD Vector Art (Modern Clean 2D)</option>
+            <option value="Detailed Hand-Drawn 2D">Detailed Hand-Drawn 2D (Arcade Fighter)</option>
+            <option value="Painterly 2D Concept Art">Painterly 2D Concept Art (Stylized Fantasy)</option>
+            <option value="Western Cartoon Brawler">Western Cartoon Brawler (Expressive Cel)</option>
+            <option value="16-bit Retro Arcade Pixel Art">16-bit Retro Arcade Pixel Art</option>
+            <option value="8-bit Classic NES Pixel Art">8-bit Classic NES Pixel Art</option>
           </select>
         </div>
 
-        <!-- Sprite Size Selection -->
         <div class="form-group">
-          <label>Sprite Frame Size</label>
+          <label>Sprite Frame Sizing</label>
           <select id="spriteSizePreset" onchange="handleSizeChange()">
-            <option value="256x256" selected>256 x 256 (High-Res 2D / Vector - Default)</option>
-            <option value="512x512">512 x 512 (Ultra-HD / 4K Detailed Vector)</option>
-            <option value="128x128">128 x 128 (HD Pixel Art / Compact 2D)</option>
-            <option value="64x64">64 x 64 (Classic 16-bit / Retro)</option>
-            <option value="192x256">192 x 256 (Tall Brawler / Platformer Sprite)</option>
-            <option value="custom">Custom Dimensions (w x h)...</option>
+            <option value="64x64">64 x 64 (Classic Retro)</option>
+            <option value="128x128">128 x 128 (Standard Indie)</option>
+            <option value="192x256">192 x 256 (Tall Fighting Game / Metroidvania)</option>
+            <option value="256x256" selected>256 x 256 (HD Standard Default)</option>
+            <option value="512x512">512 x 512 (Ultra High-Res Vector & Bosses)</option>
+            <option value="custom">Custom Dimensions...</option>
           </select>
-        </div>
-
-        <div id="customSizeRow" style="display:none; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:14px;">
-          <div>
-            <label>Width (px)</label>
-            <input type="number" id="customWidth" value="256" min="32" max="1024" step="8">
-          </div>
-          <div>
-            <label>Height (px)</label>
-            <input type="number" id="customHeight" value="256" min="32" max="1024" step="8">
+          <div id="customSizeRow" style="display:none; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
+            <input type="number" id="customWidth" value="256" placeholder="Width (px)">
+            <input type="number" id="customHeight" value="256" placeholder="Height (px)">
           </div>
         </div>
 
         <div class="form-group">
-          <label>Output Format (Single Output - No Duplicates)</label>
+          <label>Output Mode</label>
           <select id="outputStyle">
-            <option value="standard" selected>Standard Clean Animation (Single output)</option>
-            <option value="retro">PixelLab Chunky Pixel Art (Nearest-Neighbor)</option>
+            <option value="standard" selected>Standard (Clean Single Output)</option>
+            <option value="retro">Pixel-Snapped Downscaled (Retro only)</option>
+            <option value="both">Both (Standard + Retro Variants)</option>
           </select>
         </div>
 
-        <div class="form-group" style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
-          <div>
-            <label>Seed</label>
-            <input type="text" id="charSeed" value="424242">
-          </div>
-          <div>
-            <label>&nbsp;</label>
-            <button class="btn-sm" style="width:100%; height:38px;" onclick="randomizeSeed()">🎲 Randomize</button>
+        <div class="form-group">
+          <label>Character Anatomy / Moveset Mode</label>
+          <div class="anatomy-toggle">
+            <button class="pill-btn active" id="pillHuman" onclick="toggleAnatomy(false)">👤 Humanoid</button>
+            <button class="pill-btn" id="pillCreature" onclick="toggleAnatomy(true)">🐾 Creature / Monster</button>
           </div>
         </div>
 
-        <button class="btn-trigger" id="btnGenerate" onclick="startGeneration()">
-          🚀 Generate Sprite Pack (<span id="selectedCount">52</span> Animations)
+        <div class="form-group">
+          <label>Master Random Seed</label>
+          <div style="display:flex; gap:8px;">
+            <input type="number" id="charSeed" value="424242">
+            <button class="btn-sm" onclick="randomizeSeed()" title="Randomize Seed">🎲</button>
+          </div>
+        </div>
+
+        <button class="btn-primary" id="btnGenerate" onclick="startGeneration()">
+          🚀 Generate Sprite Pack (<span id="selectedCount">52</span> Moves)
         </button>
 
+        <!-- Live Progress Status Bar -->
         <div class="status-bar" id="statusBar" style="display:none;">
           <div class="status-header">
-            <span id="statusText">Queuing animations...</span>
-            <span id="statusPercent">0%</span>
+            <span id="statusText">Queuing animations into GPU...</span>
+            <span id="statusPercent" style="color:var(--accent); font-weight:800;">0%</span>
           </div>
-          <div class="progress-track">
+          <div class="progress-bg">
             <div class="progress-fill" id="progressFill"></div>
+          </div>
+          <div class="status-preview-row" id="statusPreviewRow" style="display:none;">
+            <img id="statusLiveImg" class="status-preview-img" src="" alt="Live Preview">
+            <div style="flex:1;">
+              <div class="status-action-title" id="statusCurrentAction">Processing move...</div>
+              <div class="status-action-desc" id="statusCountDetail">0 / 52 Completed</div>
+            </div>
+            <button class="btn-sm btn-danger" onclick="cancelActiveBatch()">⏹ Stop</button>
           </div>
         </div>
       </div>
 
-      <!-- Right Move Selector -->
+      <!-- Right Moveset Panel -->
       <div class="panel">
-        <h2>
-          <span>2. Moveset & Customization</span>
-          <div style="display:flex; gap:8px;">
-            <button class="btn-sm" style="background:#0284c7; color:#fff;" onclick="openAddCustomModal()">➕ Add Custom Move</button>
-            <span style="font-size:12px; color:var(--accent);" id="countBadge">52 / 52 Selected</span>
+        <div class="moves-toolbar">
+          <div class="cat-filters" id="catFilters">
+            <button class="cat-btn active" onclick="filterCategory('All')">All (52)</button>
+            <button class="cat-btn" onclick="filterCategory('Locomotion')">Locomotion (8)</button>
+            <button class="cat-btn" onclick="filterCategory('Standing Strikes')">Strikes (5)</button>
+            <button class="cat-btn" onclick="filterCategory('Standing Kicks')">Kicks (5)</button>
+            <button class="cat-btn" onclick="filterCategory('Aerial Attacks')">Air Attacks (8)</button>
+            <button class="cat-btn" onclick="filterCategory('Crouch Moves')">Crouch & Blocks (9)</button>
+            <button class="cat-btn" onclick="filterCategory('Items & Projectiles')">Items & Projectiles (5)</button>
+            <button class="cat-btn" onclick="filterCategory('Reactions & Statuses')">Statuses (8)</button>
+            <button class="cat-btn" onclick="filterCategory('Specials')">Specials (4)</button>
           </div>
-        </h2>
-
-        <div class="anim-selector-bar">
-          <div>
+          <div style="display:flex; gap:6px;">
+            <button class="btn-ai" onclick="optimizeAllMovePrompts()" title="Enhance all 52 move prompts with Local Ollama AI">✨ AI Optimize All</button>
             <button class="btn-sm" onclick="selectAll(true)">Select All</button>
-            <button class="btn-sm" onclick="selectAll(false)">Deselect All</button>
-          </div>
-          <div style="display:flex; gap:4px; flex-wrap:wrap;">
-            <button class="btn-sm" onclick="filterCategory('All')">All</button>
-            <button class="btn-sm" onclick="filterCategory('Locomotion')">Locomotion</button>
-            <button class="btn-sm" onclick="filterCategory('Standing Strikes')">Strikes</button>
-            <button class="btn-sm" onclick="filterCategory('Aerial Attacks')">Air</button>
-            <button class="btn-sm" onclick="filterCategory('Crouch Moves')">Crouch</button>
-            <button class="btn-sm" onclick="filterCategory('Reactions & Statuses')">Status</button>
-            <button class="btn-sm" onclick="filterCategory('Specials')">Specials</button>
+            <button class="btn-sm" onclick="selectAll(false)">Clear</button>
+            <button class="btn-sm" style="background:#0284c7; color:#fff;" onclick="openAddCustomModal()">➕ Add Custom Move</button>
           </div>
         </div>
 
-        <div class="anim-grid" id="animGrid"></div>
+        <div class="anim-grid" id="animGrid">
+          <!-- Animation cards injected here -->
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- TAB 2: VFX & PROJECTILE GENERATOR -->
-  <div class="tab-content" id="tabVFX">
+  <!-- ================= 2D VFX / PROJECTILES TAB ================= -->
+  <div id="tabVFX" class="tab-content">
     <div class="grid-layout">
-      <!-- Left Config -->
       <div class="panel">
-        <h2>1. VFX Generator Setup</h2>
-
+        <div class="panel-title">✨ VFX & Projectiles Studio</div>
         <div class="form-group">
-          <label>VFX Set Name</label>
-          <input type="text" id="vfxName" value="plasma_blast" placeholder="e.g. fire_magic, slash_fx">
+          <label>VFX Preset Name</label>
+          <input type="text" id="vfxName" value="fireball" placeholder="e.g. plasma_orb, ice_shard">
         </div>
-
         <div class="form-group">
-          <label>Custom VFX Prompt (or pick from right)</label>
-          <textarea id="vfxDesc" placeholder="Describe the energy, color, particles, explosion, or projectile motion...">glowing electric blue plasma energy orb with crackling lightning arcs swirling around core</textarea>
+          <label>VFX Effect Prompt</label>
+          <textarea id="vfxDesc">fiery plasma energy fireball projectile flying forward, swirling orange flame particles, glowing bright combustion trail</textarea>
         </div>
-
         <div class="form-group">
-          <label>VFX Art Style</label>
+          <label>VFX Art Medium</label>
           <select id="vfxStyle">
-            <option value="Smooth HD Vector Art" selected>Smooth HD Vector VFX (Clean glow, modern indie game)</option>
-            <option value="16-bit Retro Pixel Art">16-bit Retro Pixel Art VFX (Arcade pixel energy)</option>
+            <option value="Smooth HD Vector Art" selected>Smooth HD Vector Art (Luminous modern glow)</option>
+            <option value="16-bit Retro Pixel Art">16-bit Retro Arcade Pixel Art</option>
           </select>
         </div>
-
         <div class="form-group">
-          <label>VFX Frame Size</label>
-          <select id="vfxSize">
-            <option value="256x256" selected>256 x 256 (High Resolution - Default)</option>
-            <option value="128x128">128 x 128 (Compact)</option>
-            <option value="512x512">512 x 512 (Cinematic Screen-Filling VFX)</option>
+          <label>Resolution</label>
+          <select id="vfxSizePreset">
+            <option value="128x128">128 x 128 (Standard Projectile)</option>
+            <option value="256x256" selected>256 x 256 (High Detail Burst)</option>
+            <option value="512x512">512 x 512 (Colossal Ultimate Spell)</option>
           </select>
         </div>
-
-        <div class="form-group" style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
-          <div>
-            <label>Seed</label>
-            <input type="text" id="vfxSeed" value="987654">
-          </div>
-          <div>
-            <label>&nbsp;</label>
-            <button class="btn-sm" style="width:100%; height:38px;" onclick="randomizeVFXSeed()">🎲 Randomize</button>
+        <div class="form-group">
+          <label>Random Seed</label>
+          <div style="display:flex; gap:8px;">
+            <input type="number" id="vfxSeed" value="987654">
+            <button class="btn-sm" onclick="randomizeVFXSeed()">🎲</button>
           </div>
         </div>
-
-        <button class="btn-trigger" style="background: linear-gradient(135deg, #e11d48, #9333ea);" onclick="startVFXGeneration()">
-          ✨ Generate VFX Animation (<span id="vfxSelectedCount">1</span> Selected)
+        <button class="btn-primary" id="btnGenerateVFX" onclick="startVFXGeneration()">
+          ✨ Generate VFX Animation
         </button>
 
         <div class="status-bar" id="vfxStatusBar" style="display:none;">
           <div class="status-header">
-            <span id="vfxStatusText">Queuing VFX...</span>
+            <span id="vfxStatusText">Rendering VFX on GPU...</span>
+          </div>
+          <div class="progress-bg">
+            <div class="progress-fill" style="width:100%;"></div>
           </div>
         </div>
       </div>
 
-      <!-- Right VFX Preset Selector -->
       <div class="panel">
-        <h2>2. VFX Presets Library (Click to Load Preset)</h2>
-        <div class="anim-grid" id="vfxGrid"></div>
+        <div class="panel-title">15+ Built-in 2D VFX Presets</div>
+        <div class="anim-grid" id="vfxGrid">
+          <!-- VFX cards -->
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- TAB 3: ASSET LIBRARY -->
-  <div class="tab-content" id="tabLibrary">
+  <!-- ================= ASSET LIBRARY TAB ================= -->
+  <div id="tabLibrary" class="tab-content">
     <div class="panel">
-      <h2>
-        <span>Asset Library</span>
-        <button class="btn-sm" onclick="loadAssetLibrary()">🔄 Refresh</button>
-      </h2>
-
-      <div class="library-filters">
-        <input type="text" id="libSearch" placeholder="🔍 Search by character or action name..." style="width:280px;" oninput="filterLibrary()">
-        <select id="libTypeFilter" style="width:180px;" onchange="filterLibrary()">
-          <option value="all">All Types</option>
-          <option value="character">Characters</option>
-          <option value="vfx">VFX & Projectiles</option>
-        </select>
-        <button class="btn-sm" onclick="downloadSelectedCharZip()">📦 Download Character ZIP</button>
+      <div class="panel-title">
+        <span>📦 Generated Game Assets & Sprite Sheets</span>
+        <div style="display:flex; gap:8px;">
+          <button class="btn-sm" onclick="loadAssetLibrary()">🔄 Refresh Library</button>
+          <button class="btn-sm" style="background:#0284c7; color:#fff;" onclick="downloadZip()">📦 Download Character ZIP</button>
+          <button class="btn-sm" onclick="openOutputFolder()">📂 Open Output Folder</button>
+        </div>
       </div>
-
       <div class="library-grid" id="libraryGrid">
-        <div style="color:var(--text-muted); font-size:13px;">Loading assets...</div>
+        <!-- Asset cards -->
       </div>
     </div>
   </div>
+
 </div>
 
-<!-- Modal: Add Custom Move -->
-<div id="modalAddCustom" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:200; align-items:center; justify-content:center;">
-  <div class="panel" style="width:480px; max-width:90%;">
-    <h2>➕ Add Custom Animation Move</h2>
+<!-- MODAL: Add Custom Move -->
+<div class="modal-overlay" id="modalAddCustom">
+  <div class="modal-box">
+    <div class="modal-title">➕ Add Custom Animation Move</div>
     <div class="form-group">
-      <label>Move ID (e.g. wall_climb, tail_whip)</label>
-      <input type="text" id="customMoveId" placeholder="e.g. wall_climb">
+      <label>Move Identifier (Snake Case)</label>
+      <input type="text" id="customMoveId" placeholder="e.g. lightning_teleport, spin_slash">
     </div>
     <div class="form-group">
-      <label>Move Display Name</label>
-      <input type="text" id="customMoveName" placeholder="e.g. Wall Climb">
+      <label>Display Name</label>
+      <input type="text" id="customMoveName" placeholder="e.g. Lightning Teleport">
     </div>
     <div class="form-group">
       <label>Category</label>
@@ -878,12 +1258,12 @@ textarea { resize: vertical; min-height: 75px; }
         <option value="Crouch Moves">Crouch Moves</option>
         <option value="Items & Projectiles">Items & Projectiles</option>
         <option value="Reactions & Statuses">Reactions & Statuses</option>
-        <option value="Specials">Specials</option>
+        <option value="Specials" selected>Specials</option>
       </select>
     </div>
     <div class="form-group">
-      <label>Action Prompt Description</label>
-      <textarea id="customMovePrompt" placeholder="Describe the character's exact movement, limbs, weapon, trail..."></textarea>
+      <label>Action Motion Description</label>
+      <textarea id="customMovePrompt" placeholder="Describe the 4-frame animation motion..."></textarea>
     </div>
     <div style="display:flex; justify-content:flex-end; gap:8px;">
       <button class="btn-sm" onclick="closeAddCustomModal()">Cancel</button>
@@ -892,10 +1272,10 @@ textarea { resize: vertical; min-height: 75px; }
   </div>
 </div>
 
-<!-- Modal: Re-run Move -->
-<div id="modalRerun" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:200; align-items:center; justify-content:center;">
-  <div class="panel" style="width:460px; max-width:90%;">
-    <h2>🔁 Re-run Animation Move</h2>
+<!-- MODAL: Re-run Single Move -->
+<div class="modal-overlay" id="modalRerun">
+  <div class="modal-box">
+    <div class="modal-title">🔁 Re-run Single Animation</div>
     <div class="form-group">
       <label>Action Name</label>
       <input type="text" id="rerunMoveName" readonly style="opacity:0.7;">
@@ -925,17 +1305,37 @@ let isCreatureMode = false;
 let pollingInterval = null;
 let libraryData = [];
 let currentRerunItem = null;
+let selectedRefImage = null; // Filename of uploaded reference
 
 async function init() {
   const res1 = await fetch('/api/presets');
   animations = await res1.json();
+  animations.forEach(a => a.selected = true);
 
   const res2 = await fetch('/api/vfx_presets');
   vfxList = await res2.json();
 
+  checkLLMStatus();
   renderAnimations();
   renderVFX();
   loadAssetLibrary();
+}
+
+async function checkLLMStatus() {
+  try {
+    const res = await fetch('/api/llm_status');
+    const data = await res.json();
+    const badge = document.getElementById('aiStatusBadge');
+    if (data.available) {
+      badge.innerHTML = `<span class="dot-live"></span> Ollama: ${data.model}`;
+      badge.style.display = 'inline-flex';
+    } else {
+      badge.innerHTML = `⚠️ Local AI Offline`;
+      badge.style.background = '#334155';
+    }
+  } catch (e) {
+    console.warn("LLM check error:", e);
+  }
 }
 
 function handleSizeChange() {
@@ -968,7 +1368,7 @@ function updateStyleNotice() {
   const style = document.getElementById('artStyle').value;
   const isPixel = style.includes('Pixel Art') || style.includes('NES');
   const outStyle = document.getElementById('outputStyle');
-  if (!isPixel) {
+  if (!isPixel && outStyle.value !== 'standard') {
     outStyle.value = 'standard';
   }
 }
@@ -996,26 +1396,38 @@ function renderAnimations(catFilter = 'All') {
   const grid = document.getElementById('animGrid');
   grid.innerHTML = '';
 
-  animations.forEach((anim, idx) => {
+  animations.forEach((anim) => {
     if (catFilter !== 'All' && anim.cat !== catFilter) return;
 
     const card = document.createElement('div');
-    card.className = 'anim-card' + (anim.selected !== false ? ' selected' : '');
+    card.id = `card_${anim.id}`;
+    card.className = 'anim-card' + (anim.selected ? ' selected' : '') + (anim.isDone ? ' done' : '') + (anim.isRunning ? ' running' : '');
 
     const defaultDesc = isCreatureMode ? anim.creature : anim.human;
     const currentDesc = anim.custom_prompt !== undefined ? anim.custom_prompt : defaultDesc;
 
+    let badgeHtml = '';
+    if (anim.isRunning) {
+      badgeHtml = `<span class="card-badge-status badge-running">⚡ Running</span>`;
+    } else if (anim.isDone) {
+      badgeHtml = `<span class="card-badge-status badge-done">✓ Done</span>`;
+    }
+
     card.innerHTML = `
       <div class="anim-header">
         <label class="anim-title">
-          <input type="checkbox" ${anim.selected !== false ? 'checked' : ''} onchange="toggleSelect(${idx}, this.checked)">
+          <input type="checkbox" ${anim.selected ? 'checked' : ''} onchange="toggleSelect('${anim.id}', this.checked)">
           <span>${anim.name}</span>
         </label>
         <span class="anim-cat">${anim.cat}</span>
       </div>
-      <textarea class="anim-prompt-box" placeholder="Customize action prompt..." onchange="updateCustomPrompt(${idx}, this.value)">${currentDesc}</textarea>
-      <div style="display:flex; justify-content:flex-end; margin-top:6px;">
-        <button class="btn-sm" onclick="openRerunModalSingle(${idx})" title="Generate only this move">🔁 Re-run</button>
+      <textarea class="anim-prompt-box" id="box_${anim.id}" placeholder="Customize action prompt..." onchange="updateCustomPrompt('${anim.id}', this.value)">${currentDesc}</textarea>
+      <div class="card-actions">
+        <div>${badgeHtml}</div>
+        <div style="display:flex; gap:4px;">
+          <button class="btn-ai" onclick="optimizeSingleMovePrompt('${anim.id}')" title="AI optimize this move">✨ AI</button>
+          <button class="btn-sm" onclick="openRerunModalSingle('${anim.id}')" title="Generate only this move">🔁 Re-run</button>
+        </div>
       </div>
     `;
     grid.appendChild(card);
@@ -1023,13 +1435,19 @@ function renderAnimations(catFilter = 'All') {
   updateCounts();
 }
 
-function toggleSelect(idx, val) {
-  animations[idx].selected = val;
+function toggleSelect(id, val) {
+  const anim = animations.find(a => a.id === id);
+  if (anim) {
+    anim.selected = val;
+    const card = document.getElementById(`card_${id}`);
+    if (card) card.classList.toggle('selected', val);
+  }
   updateCounts();
 }
 
-function updateCustomPrompt(idx, val) {
-  animations[idx].custom_prompt = val;
+function updateCustomPrompt(id, val) {
+  const anim = animations.find(a => a.id === id);
+  if (anim) anim.custom_prompt = val;
 }
 
 function selectAll(state) {
@@ -1038,11 +1456,14 @@ function selectAll(state) {
 }
 
 function filterCategory(cat) {
+  document.querySelectorAll('.cat-btn').forEach(b => {
+    b.classList.toggle('active', b.innerText.includes(cat) || (cat === 'All' && b.innerText.includes('All')));
+  });
   renderAnimations(cat);
 }
 
 function updateCounts() {
-  const count = animations.filter(a => a.selected !== false).length;
+  const count = animations.filter(a => a.selected).length;
   document.getElementById('selectedCount').innerText = count;
   document.getElementById('countBadge').innerText = `${count} / ${animations.length} Selected`;
 }
@@ -1050,9 +1471,296 @@ function updateCounts() {
 function randomizeSeed() {
   document.getElementById('charSeed').value = Math.floor(Math.random() * 900000) + 100000;
 }
-
 function randomizeVFXSeed() {
   document.getElementById('vfxSeed').value = Math.floor(Math.random() * 900000) + 100000;
+}
+
+/* Reference Image Upload Handling */
+async function handleRefUpload(input) {
+  if (!input.files || !input.files[0]) return;
+  const file = input.files[0];
+
+  const reader = new FileReader();
+  reader.onload = async function(e) {
+    const base64Data = e.target.result;
+    try {
+      const res = await fetch('/api/upload_reference', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ filename: file.name, data: base64Data })
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        selectedRefImage = data.filename;
+        document.getElementById('refThumb').src = data.url;
+        document.getElementById('refFilename').innerText = data.filename;
+        document.getElementById('refEmptyPrompt').style.display = 'none';
+        document.getElementById('refLoadedRow').style.display = 'flex';
+      } else {
+        alert("Upload error: " + (data.error || "Unknown"));
+      }
+    } catch (err) {
+      alert("Error uploading reference: " + err);
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+function removeReferenceImage(e) {
+  if (e) e.stopPropagation();
+  selectedRefImage = null;
+  document.getElementById('refImageInput').value = '';
+  document.getElementById('refEmptyPrompt').style.display = 'block';
+  document.getElementById('refLoadedRow').style.display = 'none';
+}
+
+/* Local LLM / AI Prompt Optimization */
+async function optimizeCharacterPrompt() {
+  const desc = document.getElementById('charDesc').value.trim();
+  const style = document.getElementById('artStyle').value;
+  if (!desc) {
+    alert("Please enter a rough character description first!");
+    return;
+  }
+
+  const btn = event.target;
+  const oldText = btn.innerText;
+  btn.disabled = true;
+  btn.innerText = "✨ AI Thinking...";
+
+  try {
+    const res = await fetch('/api/optimize_prompt', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ type: 'character', char_desc: desc, style: style, is_creature: isCreatureMode })
+    });
+    const data = await res.json();
+    if (data.optimized) {
+      document.getElementById('charDesc').value = data.optimized;
+    } else {
+      alert("AI optimization error: " + (data.error || "Could not optimize"));
+    }
+  } catch (err) {
+    alert("AI Error: " + err);
+  } finally {
+    btn.disabled = false;
+    btn.innerText = oldText;
+  }
+}
+
+async function optimizeSingleMovePrompt(id) {
+  const anim = animations.find(a => a.id === id);
+  const charDesc = document.getElementById('charDesc').value.trim();
+  if (!anim) return;
+
+  const btn = event.target;
+  btn.disabled = true;
+  btn.innerText = "⏳...";
+
+  try {
+    const res = await fetch('/api/optimize_prompt', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ type: 'move', char_desc: charDesc, action_item: anim, is_creature: isCreatureMode })
+    });
+    const data = await res.json();
+    if (data.optimized) {
+      anim.custom_prompt = data.optimized;
+      const box = document.getElementById(`box_${id}`);
+      if (box) box.value = data.optimized;
+    }
+  } catch (err) {
+    console.error(err);
+  } finally {
+    btn.disabled = false;
+    btn.innerText = "✨ AI";
+  }
+}
+
+async function optimizeAllMovePrompts() {
+  const charDesc = document.getElementById('charDesc').value.trim();
+  const selectedMoves = animations.filter(a => a.selected);
+  if (selectedMoves.length === 0) {
+    alert("Please select moves to optimize!");
+    return;
+  }
+
+  const btn = event.target;
+  btn.disabled = true;
+  btn.innerText = "✨ AI Optimizing 52 Moves...";
+
+  try {
+    const res = await fetch('/api/optimize_prompt', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ type: 'all_moves', char_desc: charDesc, moves: selectedMoves, is_creature: isCreatureMode })
+    });
+    const data = await res.json();
+    if (data.optimized_moves) {
+      data.optimized_moves.forEach(item => {
+        const anim = animations.find(a => a.id === item.id);
+        if (anim) {
+          anim.custom_prompt = item.prompt;
+          const box = document.getElementById(`box_${item.id}`);
+          if (box) box.value = item.prompt;
+        }
+      });
+    }
+  } catch (err) {
+    alert("Error optimizing all moves: " + err);
+  } finally {
+    btn.disabled = false;
+    btn.innerText = "✨ AI Optimize All";
+  }
+}
+
+/* Generation & Background Polling */
+async function startGeneration() {
+  const name = document.getElementById('charName').value.trim() || 'hero';
+  const desc = document.getElementById('charDesc').value.trim();
+  const seed = parseInt(document.getElementById('charSeed').value) || 424242;
+  const style = document.getElementById('artStyle').value;
+  const outputStyle = document.getElementById('outputStyle').value;
+  const selectedMoves = animations.filter(a => a.selected);
+  const dims = getSelectedDimensions();
+
+  if (selectedMoves.length === 0) {
+    alert("Please select at least one animation!");
+    return;
+  }
+
+  // Reset done and running states
+  animations.forEach(a => {
+    a.isDone = false;
+    a.isRunning = false;
+  });
+  renderAnimations();
+
+  const btn = document.getElementById('btnGenerate');
+  btn.disabled = true;
+  btn.innerText = "⏳ Queuing into ComfyUI...";
+
+  document.getElementById('statusBar').style.display = 'block';
+  document.getElementById('statusPreviewRow').style.display = 'flex';
+  document.getElementById('statusText').innerText = `Queuing ${selectedMoves.length} animations (${dims.w}x${dims.h})...`;
+  document.getElementById('statusPercent').innerText = "0%";
+  document.getElementById('progressFill').style.width = "0%";
+
+  const payload = {
+    char_name: name,
+    char_desc: desc,
+    seed: seed,
+    style: style,
+    output_style: outputStyle,
+    is_creature: isCreatureMode,
+    ref_image: selectedRefImage,
+    selected_moves: selectedMoves,
+    frame_width: dims.w,
+    frame_height: dims.h
+  };
+
+  try {
+    const res = await fetch('/api/generate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      btn.innerText = `Processing Batch (${selectedMoves.length} items)...`;
+      startPolling();
+    } else {
+      alert("Error starting batch: " + (data.error || "Unknown"));
+      btn.disabled = false;
+      btn.innerText = "🚀 Generate Sprite Pack";
+    }
+  } catch (err) {
+    alert("Error queuing: " + err);
+    btn.disabled = false;
+    btn.innerText = "🚀 Generate Sprite Pack";
+  }
+}
+
+function startPolling() {
+  if (pollingInterval) clearInterval(pollingInterval);
+  pollingInterval = setInterval(async () => {
+    try {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+
+      const pct = data.percent || 0;
+      document.getElementById('statusPercent').innerText = `${pct}%`;
+      document.getElementById('progressFill').style.width = `${pct}%`;
+
+      if (data.is_running) {
+        document.getElementById('statusText').innerText = `Rendering on GPU: ${data.completed_count} / ${data.total_queued} complete`;
+        document.getElementById('statusCurrentAction').innerText = data.current_move ? `⚡ Generating: ${data.current_move}` : "Rendering frames...";
+        document.getElementById('statusCountDetail').innerText = `${data.completed_count} / ${data.total_queued} finished`;
+
+        if (data.latest_preview) {
+          const img = document.getElementById('statusLiveImg');
+          img.src = `${data.latest_preview}?t=${new Date().getTime()}`;
+        }
+
+        // Update card status in grid
+        animations.forEach(a => {
+          const isFinished = (data.completed_ids || []).includes(a.id);
+          const isCurrent = (data.current_id === a.id);
+          if (a.isDone !== isFinished || a.isRunning !== isCurrent) {
+            a.isDone = isFinished;
+            a.isRunning = isCurrent;
+            const card = document.getElementById(`card_${a.id}`);
+            if (card) {
+              card.classList.toggle('done', isFinished);
+              card.classList.toggle('running', isCurrent);
+              const badgeSlot = card.querySelector('.card-badge-status');
+              if (badgeSlot) {
+                if (isCurrent) {
+                  badgeSlot.className = 'card-badge-status badge-running';
+                  badgeSlot.innerText = '⚡ Running';
+                } else if (isFinished) {
+                  badgeSlot.className = 'card-badge-status badge-done';
+                  badgeSlot.innerText = '✓ Done';
+                }
+              }
+            }
+          }
+        });
+      } else {
+        // Not running
+        if (data.total_queued > 0 && data.completed_count >= data.total_queued) {
+          clearInterval(pollingInterval);
+          document.getElementById('statusText').innerText = "🎉 All Animations Complete!";
+          document.getElementById('statusPercent').innerText = "100%";
+          document.getElementById('progressFill').style.width = "100%";
+          document.getElementById('btnGenerate').disabled = false;
+          document.getElementById('btnGenerate').innerText = "🚀 Generate Sprite Pack";
+
+          // Mark all selected as done
+          animations.forEach(a => { if (a.selected) a.isDone = true; a.isRunning = false; });
+          renderAnimations();
+          loadAssetLibrary();
+        }
+      }
+    } catch (e) {
+      console.error("Polling error:", e);
+    }
+  }, 1200);
+}
+
+async function cancelActiveBatch() {
+  if (!confirm("Are you sure you want to stop the generation batch?")) return;
+  try {
+    await fetch('/api/cancel_batch', { method: 'POST' });
+    if (pollingInterval) clearInterval(pollingInterval);
+    document.getElementById('statusBar').style.display = 'none';
+    document.getElementById('btnGenerate').disabled = false;
+    document.getElementById('btnGenerate').innerText = "🚀 Generate Sprite Pack";
+    animations.forEach(a => a.isRunning = false);
+    renderAnimations();
+  } catch (err) {
+    alert("Error cancelling: " + err);
+  }
 }
 
 /* Custom Move Modal */
@@ -1092,8 +1800,9 @@ function submitCustomMove() {
 }
 
 /* Re-run Modal */
-function openRerunModalSingle(idx) {
-  const anim = animations[idx];
+function openRerunModalSingle(id) {
+  const anim = animations.find(a => a.id === id);
+  if (!anim) return;
   currentRerunItem = anim;
   document.getElementById('rerunMoveName').value = `${anim.name} (${anim.id})`;
   document.getElementById('rerunPrompt').value = anim.custom_prompt || (isCreatureMode ? anim.creature : anim.human);
@@ -1105,113 +1814,47 @@ function closeRerunModal() {
 }
 async function submitRerun() {
   if (!currentRerunItem) return;
+
   const name = document.getElementById('charName').value.trim() || 'hero';
   const desc = document.getElementById('charDesc').value.trim();
-  const seed = parseInt(document.getElementById('rerunSeed').value) || 424242;
   const style = document.getElementById('artStyle').value;
   const outputStyle = document.getElementById('outputStyle').value;
-  const customPrompt = document.getElementById('rerunPrompt').value.trim();
   const dims = getSelectedDimensions();
+  const overridePrompt = document.getElementById('rerunPrompt').value.trim();
+  const customSeed = parseInt(document.getElementById('rerunSeed').value) || 424242;
 
+  currentRerunItem.custom_prompt = overridePrompt;
   closeRerunModal();
 
-  const payload = {
-    char_name: name,
-    char_desc: desc,
-    seed: seed,
-    style: style,
-    output_style: outputStyle,
-    is_creature: isCreatureMode,
-    action_item: currentRerunItem,
-    custom_prompt: customPrompt,
-    frame_width: dims.w,
-    frame_height: dims.h
-  };
+  const card = document.getElementById(`card_${currentRerunItem.id}`);
+  if (card) {
+    card.classList.add('running');
+    card.classList.remove('done');
+  }
 
   try {
-    await fetch('/api/generate_single', {
+    const res = await fetch('/api/generate_single', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        char_name: name,
+        char_desc: desc,
+        seed: customSeed,
+        style: style,
+        output_style: outputStyle,
+        is_creature: isCreatureMode,
+        ref_image: selectedRefImage,
+        action_item: currentRerunItem,
+        custom_prompt: overridePrompt,
+        frame_width: dims.w,
+        frame_height: dims.h
+      })
     });
-    alert(`Queued ${currentRerunItem.name} for regeneration!`);
-    loadAssetLibrary();
+    const data = await res.json();
+    alert(`Queued move into GPU (PID: ${data.pid}). Asset Library will update once finished.`);
   } catch (err) {
-    alert("Error: " + err);
+    alert("Error queuing single move: " + err);
   }
-}
-
-/* Batch Generation */
-async function startGeneration() {
-  const name = document.getElementById('charName').value.trim() || 'hero';
-  const desc = document.getElementById('charDesc').value.trim();
-  const seed = parseInt(document.getElementById('charSeed').value) || 424242;
-  const style = document.getElementById('artStyle').value;
-  const outputStyle = document.getElementById('outputStyle').value;
-  const selectedMoves = animations.filter(a => a.selected !== false);
-  const dims = getSelectedDimensions();
-
-  if (selectedMoves.length === 0) {
-    alert("Please select at least one animation!");
-    return;
-  }
-
-  const btn = document.getElementById('btnGenerate');
-  btn.disabled = true;
-  btn.innerText = "⏳ Queuing into ComfyUI...";
-
-  document.getElementById('statusBar').style.display = 'block';
-  document.getElementById('statusText').innerText = `Queuing ${selectedMoves.length} animations (${dims.w}x${dims.h})...`;
-
-  const payload = {
-    char_name: name,
-    char_desc: desc,
-    seed: seed,
-    style: style,
-    output_style: outputStyle,
-    is_creature: isCreatureMode,
-    selected_moves: selectedMoves,
-    frame_width: dims.w,
-    frame_height: dims.h
-  };
-
-  try {
-    await fetch('/api/generate', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload)
-    });
-    btn.innerText = `Running Batch (${selectedMoves.length} items)`;
-    startPolling();
-  } catch (err) {
-    alert("Error queuing: " + err);
-    btn.disabled = false;
-    btn.innerText = "🚀 Generate Sprite Pack";
-  }
-}
-
-function startPolling() {
-  if (pollingInterval) clearInterval(pollingInterval);
-  pollingInterval = setInterval(async () => {
-    try {
-      const res = await fetch('/api/status');
-      const data = await res.json();
-      const pct = data.total_queued > 0 ? Math.min(100, Math.round((data.completed_count / data.total_queued) * 100)) : 0;
-
-      document.getElementById('statusPercent').innerText = `${pct}%`;
-      document.getElementById('progressFill').style.width = `${pct}%`;
-      document.getElementById('statusText').innerText = data.is_running ? "Processing on AMD Radeon RX 9060 XT..." : "Batch Finished!";
-
-      if (!data.is_running && pct >= 100) {
-        clearInterval(pollingInterval);
-        document.getElementById('btnGenerate').disabled = false;
-        document.getElementById('btnGenerate').innerText = "🚀 Generate Sprite Pack";
-        loadAssetLibrary();
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  }, 3000);
 }
 
 /* VFX Tab */
@@ -1219,7 +1862,7 @@ function renderVFX() {
   const grid = document.getElementById('vfxGrid');
   grid.innerHTML = '';
 
-  vfxList.forEach((vfx, idx) => {
+  vfxList.forEach((vfx) => {
     const card = document.createElement('div');
     card.className = 'anim-card' + (vfx.selected ? ' selected' : '');
     card.onclick = () => {
@@ -1235,7 +1878,7 @@ function renderVFX() {
         <span class="anim-title">${vfx.name}</span>
         <span class="anim-cat">${vfx.cat}</span>
       </div>
-      <div style="font-size:11px; color:var(--text-muted);">${vfx.desc}</div>
+      <p style="font-size:11px; color:var(--text-muted); line-height:1.4;">${vfx.desc}</p>
     `;
     grid.appendChild(card);
   });
@@ -1246,93 +1889,93 @@ async function startVFXGeneration() {
   const desc = document.getElementById('vfxDesc').value.trim();
   const style = document.getElementById('vfxStyle').value;
   const seed = parseInt(document.getElementById('vfxSeed').value) || 987654;
+  const selSize = document.getElementById('vfxSizePreset').value.split('x');
+  const fw = parseInt(selSize[0]);
+  const fh = parseInt(selSize[1]);
 
-  const sizeVal = document.getElementById('vfxSize').value.split('x');
-  const fw = parseInt(sizeVal[0]);
-  const fh = parseInt(sizeVal[1]);
-
-  const payload = {
-    vfx_name: name,
-    vfx_desc: desc,
-    style: style,
-    seed: seed,
-    frame_width: fw,
-    frame_height: fh
-  };
+  const btn = document.getElementById('btnGenerateVFX');
+  btn.disabled = true;
+  btn.innerText = "⏳ Rendering VFX on GPU...";
+  document.getElementById('vfxStatusBar').style.display = 'block';
 
   try {
-    await fetch('/api/generate_vfx', {
+    const res = await fetch('/api/generate_vfx', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload)
+      body: JSON.stringify({ vfx_name: name, vfx_desc: desc, style: style, seed: seed, frame_width: fw, frame_height: fh })
     });
-    alert(`Queued VFX '${name}' (${fw}x${fh}) to ComfyUI!`);
-    loadAssetLibrary();
+    const data = await res.json();
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.innerText = "✨ Generate VFX Animation";
+      document.getElementById('vfxStatusBar').style.display = 'none';
+      alert(`VFX generation queued (PID: ${data.pid}). Check the Asset Library in ~6 seconds!`);
+      loadAssetLibrary();
+    }, 4000);
   } catch (err) {
-    alert("Error: " + err);
+    alert("VFX error: " + err);
+    btn.disabled = false;
+    btn.innerText = "✨ Generate VFX Animation";
+    document.getElementById('vfxStatusBar').style.display = 'none';
   }
 }
 
-/* Asset Library */
+/* Asset Library Tab */
 async function loadAssetLibrary() {
-  const res = await fetch('/api/library');
-  libraryData = await res.json();
-  filterLibrary();
+  const grid = document.getElementById('libraryGrid');
+  try {
+    const res = await fetch('/api/library');
+    libraryData = await res.json();
+
+    grid.innerHTML = '';
+    if (libraryData.length === 0) {
+      grid.innerHTML = '<p style="color:var(--text-muted); padding:20px;">No assets generated yet. Generate a sprite or VFX to see files here!</p>';
+      return;
+    }
+
+    libraryData.forEach(asset => {
+      const card = document.createElement('div');
+      card.className = 'asset-card';
+
+      const previewSrc = asset.preview_url ? `${asset.preview_url}?t=${new Date().getTime()}` : '';
+
+      card.innerHTML = `
+        <div class="asset-preview">
+          <img src="${previewSrc}" alt="${asset.name}">
+        </div>
+        <div class="asset-title">${asset.name}</div>
+        <div class="asset-meta">${asset.type.toUpperCase()} • ${asset.date}</div>
+        <div class="asset-btn-row">
+          ${asset.apng_url ? `<a href="${asset.apng_url}" download class="btn-dl">APNG</a>` : ''}
+          ${asset.webp_url ? `<a href="${asset.webp_url}" download class="btn-dl">WEBP</a>` : ''}
+          ${asset.sheet_url ? `<a href="${asset.sheet_url}" download class="btn-dl">Sheet</a>` : ''}
+          <button class="btn-del" onclick="deleteAsset('${asset.base_prefix}')">🗑</button>
+        </div>
+      `;
+      grid.appendChild(card);
+    });
+  } catch (err) {
+    console.error("Library error:", err);
+  }
 }
 
-function filterLibrary() {
-  const search = document.getElementById('libSearch').value.toLowerCase();
-  const typeFilter = document.getElementById('libTypeFilter').value;
-  const grid = document.getElementById('libraryGrid');
-  grid.innerHTML = '';
-
-  const filtered = libraryData.filter(item => {
-    const matchSearch = item.name.toLowerCase().includes(search) || item.char.toLowerCase().includes(search);
-    const matchType = typeFilter === 'all' ? true : item.type === typeFilter;
-    return matchSearch && matchType;
-  });
-
-  if (filtered.length === 0) {
-    grid.innerHTML = '<div style="color:var(--text-muted); font-size:13px; grid-column:1/-1;">No assets matching filter found.</div>';
-    return;
-  }
-
-  filtered.forEach(item => {
-    const card = document.createElement('div');
-    card.className = 'asset-card';
-    card.innerHTML = `
-      <img src="${item.preview_url}" class="asset-preview" alt="${item.name}">
-      <div class="asset-body">
-        <div class="asset-title">${item.char}: ${item.action}</div>
-        <div class="asset-meta">
-          <span>${item.type.toUpperCase()}</span>
-          <span>${item.date}</span>
-        </div>
-        <div class="asset-actions">
-          <a href="${item.apng_url}" download class="btn-sm" title="Download Looping APNG">⬇️ APNG</a>
-          ${item.webp_url ? `<a href="${item.webp_url}" download class="btn-sm" title="Download WebP">⬇️ WebP</a>` : ''}
-          ${item.sheet_url ? `<a href="${item.sheet_url}" download class="btn-sm" title="Download Sprite Sheet">⬇️ Sheet</a>` : ''}
-          <button class="btn-sm btn-danger" onclick="deleteAsset('${item.base_prefix}')" title="Delete Asset">🗑️</button>
-        </div>
-      </div>
-    `;
-    grid.appendChild(card);
-  });
+function downloadZip() {
+  const name = document.getElementById('charName').value.trim();
+  window.location.href = `/api/download_zip?name=${encodeURIComponent(name)}`;
 }
 
 async function deleteAsset(prefix) {
-  if (!confirm(`Delete all files for '${prefix}'?`)) return;
-  await fetch(`/api/delete_asset?prefix=${encodeURIComponent(prefix)}`, {method: 'POST'});
-  loadAssetLibrary();
+  if (!confirm(`Delete asset files for '${prefix}'?`)) return;
+  try {
+    await fetch(`/api/delete_asset?prefix=${encodeURIComponent(prefix)}`, { method: 'POST' });
+    loadAssetLibrary();
+  } catch (err) {
+    alert("Delete error: " + err);
+  }
 }
 
-function downloadSelectedCharZip() {
-  const search = document.getElementById('libSearch').value.trim() || document.getElementById('charName').value.trim();
-  window.location.href = `/api/download_zip?name=${encodeURIComponent(search)}`;
-}
-
-async function openOutputFolder() {
-  await fetch('/api/open_folder', {method: 'POST'});
+function openOutputFolder() {
+  fetch('/api/open_folder', { method: 'POST' });
 }
 
 window.onload = init;
@@ -1343,6 +1986,9 @@ window.onload = init;
 """
 
 
+# ============================================================
+# HTTP Request Handler
+# ============================================================
 class StudioHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/index"):
@@ -1366,21 +2012,34 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(VFX_PRESETS).encode("utf-8"))
             return
 
-        elif self.path.startswith("/api/status"):
-            is_running = False
+        elif self.path.startswith("/api/llm_status"):
+            available = False
+            active_model = "None"
+            all_models = []
+            err_msg = ""
             try:
-                with urllib.request.urlopen(f"{COMFY_URL}/queue", timeout=2) as r:
-                    q = json.loads(r.read().decode())
-                    is_running = len(q.get("queue_running", [])) > 0 or len(q.get("queue_pending", [])) > 0
-            except Exception:
-                pass
+                with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=4.0) as r:
+                    tags = json.loads(r.read().decode())
+                    all_models = [m["name"] for m in tags.get("models", [])]
+                    if len(all_models) > 0:
+                        available = True
+                        active_model = "qwen2.5:3b" if any("qwen" in m for m in all_models) else all_models[0]
+            except Exception as e:
+                err_msg = str(e)
 
-            data = {
-                "is_running": is_running,
-                "completed_count": getattr(self.server, "completed_count", 0),
-                "total_queued": getattr(self.server, "last_queued_count", 0)
-            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "available": available,
+                "model": active_model,
+                "models": all_models,
+                "error": err_msg
+            }).encode("utf-8"))
+            return
 
+        elif self.path.startswith("/api/status"):
+            data = GLOBAL_JOB_MGR.get_status()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1433,7 +2092,6 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
 
         elif self.path.startswith("/api/download_zip"):
-            import urllib.parse
             query = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(query)
             char_filter = params.get("name", [""])[0].lower()
@@ -1456,7 +2114,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
 
         elif self.path.startswith("/output/"):
-            filename = self.path.replace("/output/", "")
+            filename = self.path.replace("/output/", "").split("?")[0]
             file_path = os.path.join(OUTPUT_DIR, filename)
             if os.path.exists(file_path):
                 self.send_response(200)
@@ -1473,59 +2131,190 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
+        elif self.path.startswith("/input/"):
+            filename = self.path.replace("/input/", "").split("?")[0]
+            file_path = os.path.join(INPUT_DIR, filename)
+            if os.path.exists(file_path):
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.end_headers()
+                with open(file_path, "rb") as f:
+                    self.wfile.write(f.read())
+                return
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+
         self.send_response(404)
         self.end_headers()
 
     def do_POST(self):
-        if self.path == "/api/generate":
-            content_len = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(content_len).decode("utf-8"))
+        content_len = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else "{}"
+        try:
+            data = json.loads(raw_body)
+        except Exception:
+            data = {}
 
-            char_name = data.get("char_name", "hero")
-            char_desc = data.get("char_desc", "")
-            seed = int(data.get("seed", 424242))
-            style = data.get("style", "Smooth HD Vector Art")
-            output_style = data.get("output_style", "standard")
-            is_creature = bool(data.get("is_creature", False))
-            selected_moves = data.get("selected_moves", [])
-            fw = int(data.get("frame_width", 256))
-            fh = int(data.get("frame_height", 256))
+        if self.path == "/api/upload_reference":
+            filename = data.get("filename", "ref_image.png")
+            base64_str = data.get("data", "")
+            if "," in base64_str:
+                base64_str = base64_str.split(",", 1)[1]
 
-            queued = []
-            for move in selected_moves:
-                custom_p = move.get("custom_prompt")
-                prompt_dict = build_character_graph(char_desc, move, is_creature, style, output_style, seed, char_name, custom_p, fw, fh)
-                try:
-                    pid = send_to_comfy(prompt_dict)
-                    queued.append(pid)
-                except Exception as e:
-                    print(f"Error queueing {move.get('id')}: {e}")
+            img_bytes = base64.b64decode(base64_str)
+            clean_filename = f"ref_{uuid.uuid4().hex[:8]}_{filename}"
 
-            self.server.last_queued_count = len(queued)
-            self.server.completed_count = 0
+            dest_shared = os.path.join(INPUT_DIR, clean_filename)
+            with open(dest_shared, "wb") as f:
+                f.write(img_bytes)
+
+            if os.path.exists(COMFY_INPUT_DIR):
+                dest_comfy = os.path.join(COMFY_INPUT_DIR, clean_filename)
+                with open(dest_comfy, "wb") as f:
+                    f.write(img_bytes)
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok", "queued": len(queued)}).encode("utf-8"))
+            self.wfile.write(json.dumps({
+                "status": "ok",
+                "filename": clean_filename,
+                "url": f"/input/{clean_filename}"
+            }).encode("utf-8"))
             return
 
-        elif self.path == "/api/generate_single":
-            content_len = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(content_len).decode("utf-8"))
+        elif self.path == "/api/optimize_prompt":
+            p_type = data.get("type", "character")
+            char_desc = data.get("char_desc", "")
+            style = data.get("style", "Smooth HD Vector Art")
+            is_creature = bool(data.get("is_creature", False))
 
+            if p_type == "character":
+                sys_prompt = (
+                    "You are an expert game sprite visual designer. Given a rough character description, write a rich, concise visual prompt for a 2D game character sprite. "
+                    "Specify outfit materials, armor/clothing details, weapons, color palette, luminous glows or accents, and sharp silhouette. "
+                    "Keep it to 2-3 sentences. Output ONLY the visual description without any conversational intro, quotes, or markdown."
+                )
+                user_msg = f"Character concept: {char_desc}\nArt medium: {style}\nType: {'Creature/Monster' if is_creature else 'Humanoid'}"
+                optimized, model = query_ollama(user_msg, sys_prompt)
+
+                if not optimized:
+                    # Heuristic fallback
+                    optimized = f"{char_desc}, dynamic game character with crisp sharp outlines, detailed layered attire, signature weapons, high contrast vibrant color palette, distinct iconic silhouette"
+                    model = "heuristic"
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"optimized": optimized, "model": model}).encode("utf-8"))
+                return
+
+            elif p_type == "move":
+                action_item = data.get("action_item", {})
+                act_name = action_item.get("name", "Strike")
+                act_desc = action_item.get("creature" if is_creature else "human", "")
+
+                sys_prompt = (
+                    "You are an expert 2D game combat and animation director. Given a character concept and animation move name, "
+                    "describe the sequential 4-frame animation motion (anticipation, strike/leap, apex/impact, recovery). "
+                    "Keep it to one concise visual sentence. Output ONLY the action description without quotes, intro, or markdown."
+                )
+                user_msg = f"Character: {char_desc}\nMove: {act_name}\nBase Motion: {act_desc}"
+                optimized, model = query_ollama(user_msg, sys_prompt)
+
+                if not optimized:
+                    optimized = f"{act_desc}, dynamic fluid action keyframes with energetic anticipation, powerful strike impact, and crisp recovery motion"
+                    model = "heuristic"
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"optimized": optimized, "model": model}).encode("utf-8"))
+                return
+
+            elif p_type == "all_moves":
+                moves = data.get("moves", [])
+                results = []
+                for m in moves:
+                    base = m.get("creature" if is_creature else "human", "")
+                    enhanced = f"{base}, with character signature aura and dynamic fluid keyframes"
+                    results.append({"id": m["id"], "prompt": enhanced})
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"optimized_moves": results}).encode("utf-8"))
+                return
+
+        elif self.path == "/api/generate":
             char_name = data.get("char_name", "hero")
             char_desc = data.get("char_desc", "")
             seed = int(data.get("seed", 424242))
             style = data.get("style", "Smooth HD Vector Art")
             output_style = data.get("output_style", "standard")
             is_creature = bool(data.get("is_creature", False))
+            ref_image = data.get("ref_image")
+            selected_moves = data.get("selected_moves", [])
+            fw = int(data.get("frame_width", 256))
+            fh = int(data.get("frame_height", 256))
+
+            jobs_to_track = []
+            for move in selected_moves:
+                custom_p = move.get("custom_prompt")
+                prompt_dict = build_character_graph(
+                    char_desc, move, is_creature, style, output_style, seed, char_name, custom_p, fw, fh, ref_image
+                )
+                try:
+                    pid = send_to_comfy(prompt_dict)
+                    jobs_to_track.append({
+                        "pid": pid,
+                        "id": move.get("id"),
+                        "name": move.get("name"),
+                        "status": "queued",
+                        "preview_url": None
+                    })
+                except Exception as e:
+                    print(f"Error queueing {move.get('id')}: {e}")
+
+            batch_id = uuid.uuid4().hex[:8]
+            GLOBAL_JOB_MGR.start_batch(batch_id, char_name, jobs_to_track)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "ok",
+                "batch_id": batch_id,
+                "queued": len(jobs_to_track)
+            }).encode("utf-8"))
+            return
+
+        elif self.path == "/api/cancel_batch":
+            GLOBAL_JOB_MGR.cancel_batch()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "cancelled"}).encode("utf-8"))
+            return
+
+        elif self.path == "/api/generate_single":
+            char_name = data.get("char_name", "hero")
+            char_desc = data.get("char_desc", "")
+            seed = int(data.get("seed", 424242))
+            style = data.get("style", "Smooth HD Vector Art")
+            output_style = data.get("output_style", "standard")
+            is_creature = bool(data.get("is_creature", False))
+            ref_image = data.get("ref_image")
             action_item = data.get("action_item", {})
             custom_p = data.get("custom_prompt")
             fw = int(data.get("frame_width", 256))
             fh = int(data.get("frame_height", 256))
 
-            prompt_dict = build_character_graph(char_desc, action_item, is_creature, style, output_style, seed, char_name, custom_p, fw, fh)
+            prompt_dict = build_character_graph(
+                char_desc, action_item, is_creature, style, output_style, seed, char_name, custom_p, fw, fh, ref_image
+            )
             pid = send_to_comfy(prompt_dict)
 
             self.send_response(200)
@@ -1535,9 +2324,6 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
 
         elif self.path == "/api/generate_vfx":
-            content_len = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(content_len).decode("utf-8"))
-
             vfx_name = data.get("vfx_name", "vfx")
             vfx_desc = data.get("vfx_desc", "energy fireball projectile")
             style = data.get("style", "Smooth HD Vector Art")
@@ -1555,7 +2341,6 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
 
         elif self.path.startswith("/api/delete_asset"):
-            import urllib.parse
             query = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(query)
             prefix = params.get("prefix", [""])[0]
@@ -1587,11 +2372,10 @@ class StudioHandler(BaseHTTPRequestHandler):
 
 def run_server():
     server = HTTPServer(("127.0.0.1", PORT), StudioHandler)
-    server.last_queued_count = 0
-    server.completed_count = 0
     print(f"============================================================")
     print(f"🎮 2D Sprite, Animation & VFX Studio Running on http://127.0.0.1:{PORT}")
     print(f"Connected to ComfyUI on {COMFY_URL}")
+    print(f"Connected to Ollama on {OLLAMA_URL}")
     print(f"============================================================")
     try:
         server.serve_forever()

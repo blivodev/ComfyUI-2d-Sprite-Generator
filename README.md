@@ -8,6 +8,16 @@
 ## 🌟 Key Features
 
 * **52 Full Game Movesets**: Walk, Run, Jump, Double Jump, Crouch, Dash, Slide, Punches 1–3, Kicks 1–4, Air Attacks, Crouch Moves, Defenses, Status Conditions (Burn, Freeze, Poison, Paralyze, Stun), Item Interactions, and 4 Ultimate Specials.
+* **🖼️ Reference Image Conditioning (Optional)**: Upload or attach a reference character concept or existing sprite. Uses Z-Image Omni multimodal VAE latent conditioning to anchor the visual identity, outfit, colors, and weapons across all 52 animation moves.
+* **🤖 Local AI Prompt Optimization (Ollama)**: Integrated with local LLMs (`qwen2.5:3b`, `gemma3:4b`, `llama3.2`) running on `http://127.0.0.1:11434`:
+  * **✨ AI Enhance Character**: Expands rough descriptions into high-contrast, production-ready 2D game sprite prompts.
+  * **✨ AI Optimize Move Prompts**: Writes dynamic 4-frame animation breakdowns (anticipation, strike/leap, apex/impact, recovery) tailored specifically to your character.
+  * **✨ Optimize All 52 Moves**: One-click batch prompt optimization across the complete moveset.
+* **📊 Real-time Background JobManager & Progress Tracking**:
+  * Accurate percentage tracking (`0%` to `100%`) by monitoring ComfyUI execution history.
+  * Real-time indicator of current active move, completed move count, and live animated preview stream as each move finishes.
+  * Card status badges in the moveset grid (`⚡ Running`, `✓ Done`).
+  * `⏹ Stop / Cancel Batch` button to safely abort and clear the GPU queue anytime.
 * **🎨 Non-Pixel & Vector Art Mediums**: Generate true non-pixel art alongside pixel styles:
   * **Smooth HD Vector Art**: Crisp SVG/vector aesthetic with bold silhouettes and clean cell outlines.
   * **Detailed Hand-Drawn 2D**: High-definition hand-drawn arcade fighting game style with rich shading.
@@ -25,7 +35,7 @@
 * **✨ 2D VFX, Projectiles & Particle Studio**: Generate animated fireballs, plasma orbs, ice shards, magic star missiles, sword slash arcs, impact bursts, explosions, shield barriers, and flame auras.
 * **🚫 Clean Single Output (No Unwanted Duplicates)**: Single clean animation output by default (`standard`), with optional retro downscaled variants (`both`).
 * **📦 Interactive Web Studio UI**:
-  * **Character Studio Tab**: Configure character, art medium, frame dimensions, customize individual move prompts, and add unlimited custom animations.
+  * **Character Studio Tab**: Configure character, art medium, frame dimensions, reference image, customize individual move prompts, and add unlimited custom animations.
   * **VFX & Projectiles Tab**: 15+ built-in particle & projectile presets or prompt any custom spell.
   * **Asset Library Tab**: Live transparent looping previews, download individual APNG/WebP/Sprite Sheets, or download the full character asset pack as a `.zip`.
   * **🔁 Single Move Re-run**: Re-roll any individual animation with custom seeds and modified prompts without regenerating the entire set.
